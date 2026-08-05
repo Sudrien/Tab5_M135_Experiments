@@ -3,7 +3,9 @@ SCAD is from aoshimak https://www.thingiverse.com/thing:4764611 - copyright http
 STL removes manual supports, minimum dimensions
 
 
-I think it needs a shim underneath as well. I have not modeled this shim yet. 
+Spacer/shim is 2.5mm off the top of https://github.com/m5stack/M5_Hardware/blob/master/Products/M001_Module_Proto/Structures/Module_Proto_Board.stl
+
+It could probably be 2mm. 
 
 
 
@@ -25,7 +27,6 @@ arduino-cli compile --fqbn "esp32:esp32:esp32p4:FlashSize=16M,PSRAM=enabled,Part
 
 future plans
 
-- the shim
 - a extended back that will accommodate a fatter sma antenna, using the second SMA adapter that was included. I got one of those hinged mushroom style ones on order.
 - https://github.com/protomaps/PMTiles handling somehow. It will be interactive in the game map style, I think
 - maybe a navball
