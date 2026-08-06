@@ -22,25 +22,44 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <math.h>
+#include "mapconfig.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define GRID_N      3
+// GRID_N comes from mapconfig.h, and may be even.
+//
+// An odd grid has a middle tile and the marker sits inside it. An even grid
+// has no middle tile - it has a junction where the tiles meet - so the anchor
+// is that junction instead, and the grid is described by its top-left tile
+// rather than its centre.
+//
+// Both cases reduce to the same rule: the marker should stay within half a
+// tile of the canvas centre, which sits at origin + GRID_N/2 in tile units.
+// For a 3x3 that is the middle tile exactly, matching the old behaviour.
 #define GRID_COUNT  (GRID_N * GRID_N)
-#define GRID_MID    (GRID_N / 2)
-#define SUBTILE_PX  512
+// SUBTILE_PX comes from mapconfig.h so every file agrees on it.
 
 typedef struct { uint8_t z; int32_t x, y; } tile_id_t;
 
 typedef enum {
     TILE_EMPTY = 0,
-    TILE_PENDING,
-    TILE_READY,
+    TILE_PENDING,   // queued, buffer holds nothing worth showing
+    TILE_COARSE,    // upscaled from a lower zoom: approximate but drawable
+    TILE_READY,     // rendered at this zoom
     TILE_NODATA,
     TILE_ERROR
 } tile_state_t;
+
+// Drawable states. TILE_COARSE exists so a slot can show *something* the
+// instant it is created, rather than leaving a hole for the several hundred
+// milliseconds a real render takes. Cold start and zoom changes invalidate
+// all nine slots at once, which is where the difference is most visible.
+static inline int tile_drawable(tile_state_t s) {
+    return s == TILE_COARSE || s == TILE_READY;
+}
 
 typedef struct {
     tile_id_t    id;
@@ -51,10 +70,17 @@ typedef struct {
 
 typedef struct {
     subtile_t slots[GRID_COUNT];   // index = row*GRID_N + col; row 0 = north
-    tile_id_t center;              // == slots[GRID_COUNT/2].id
+    tile_id_t origin;              // top-left tile, == slots[0].id
     uint32_t  generation;
     int       initialised;
 } tile_grid_t;
+
+// The tile whose top-left corner the grid should be anchored at, for a
+// marker at fractional tile position (fx, fy). Centres the canvas on the
+// marker to within half a tile, for odd and even GRID_N alike.
+static inline int32_t grid_origin_for(double f) {
+    return (int32_t)floor(f - (double)GRID_N / 2.0 + 0.5);
+}
 
 // A render request handed to the worker queue.
 typedef struct {
@@ -67,9 +93,9 @@ typedef struct {
 // `bufs` must contain GRID_COUNT distinct pointers, each SUBTILE_PX^2 uint16.
 void grid_init(tile_grid_t *g, uint16_t *const *bufs, tile_id_t center);
 
-// The tile at (drow, dcol) relative to a centre. X wraps around the world,
+// The tile at (drow, dcol) from the grid origin. X wraps around the world,
 // Y is clamped by the caller via grid_id_valid().
-tile_id_t grid_tile_at(tile_id_t center, int drow, int dcol);
+tile_id_t grid_tile_at(tile_id_t origin, int drow, int dcol);
 int       grid_id_valid(tile_id_t id);
 
 // Shift the window by (dx, dcol east-positive) / (dy, drow south-positive).
@@ -89,8 +115,21 @@ int grid_set_zoom(tile_grid_t *g, tile_id_t new_center,
 void grid_drift(tile_grid_t *g, double frac_x, double frac_y,
                 int *dx, int *dy);
 
-// Worker-side commit. Returns 0 if the job was stale (grid moved on) and the
-// pixels should be discarded.
+// Worker-side commit, swapping in a freshly rendered buffer.
+//
+// The worker renders into a spare buffer and hands it over here; the slot's
+// previous buffer is returned through *recycled to become the next spare.
+// Swapping pointers rather than copying keeps the handover atomic under the
+// lock, and means a slot showing a coarse placeholder is never partially
+// overwritten by an in-progress render.
+//
+// Returns 0 if the job was stale, in which case *recycled is set to the
+// worker's own buffer and the slot is left untouched.
+int grid_commit_swap(tile_grid_t *g, const render_job_t *job,
+                     tile_state_t result, uint16_t *fresh, uint16_t **recycled);
+
+// Commit without a buffer swap, for results that produce no pixels
+// (TILE_NODATA, TILE_ERROR).
 int grid_commit(tile_grid_t *g, const render_job_t *job, tile_state_t result);
 
 #ifdef __cplusplus

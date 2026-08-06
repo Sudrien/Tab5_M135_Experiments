@@ -11,11 +11,13 @@ static int32_t wrap_x(int64_t x, uint8_t z) {
     return (int32_t)x;
 }
 
-tile_id_t grid_tile_at(tile_id_t c, int drow, int dcol) {
+// Offsets are from the origin (top-left), not from a centre - which is what
+// lets an even grid work at all.
+tile_id_t grid_tile_at(tile_id_t o, int drow, int dcol) {
     tile_id_t t;
-    t.z = c.z;
-    t.x = wrap_x((int64_t)c.x + dcol, c.z);
-    t.y = c.y + drow;              // deliberately unwrapped; poles are edges
+    t.z = o.z;
+    t.x = wrap_x((int64_t)o.x + dcol, o.z);
+    t.y = o.y + drow;              // deliberately unwrapped; poles are edges
     return t;
 }
 
@@ -31,37 +33,48 @@ static int same_tile(tile_id_t a, tile_id_t b) {
 // ---- job emission ----------------------------------------------------------
 // Centre first: it is the only slot guaranteed to be on screen, so it should
 // reach the worker ahead of the ring. The rest follow in slot order.
+// Nearest-to-centre first: with an even grid there is no single middle slot,
+// so order by distance from the canvas centre instead. For an odd grid this
+// still picks the middle tile first, as before.
+static int slot_rank(int i) {
+    int r = i / GRID_N, c = i % GRID_N;
+    int dr = 2 * r - (GRID_N - 1);      // doubled, to stay in integers
+    int dc = 2 * c - (GRID_N - 1);
+    return dr * dr + dc * dc;
+}
+
 static int emit_jobs(tile_grid_t *g, const int *needs,
                      render_job_t *jobs, int max_jobs)
 {
     int n = 0;
-    const int mid = GRID_COUNT / 2;
+    int done[GRID_COUNT];
+    memset(done, 0, sizeof done);
 
-    if (needs[mid] && n < max_jobs) {
-        jobs[n].id = g->slots[mid].id;
-        jobs[n].slot = (uint8_t)mid;
-        jobs[n].generation = g->generation;
-        n++;
-    }
-    for (int i = 0; i < GRID_COUNT && n < max_jobs; i++) {
-        if (i == mid || !needs[i]) continue;
-        jobs[n].id = g->slots[i].id;
-        jobs[n].slot = (uint8_t)i;
+    while (n < max_jobs) {
+        int best = -1, best_rank = 0;
+        for (int i = 0; i < GRID_COUNT; i++) {
+            if (!needs[i] || done[i]) continue;
+            int rk = slot_rank(i);
+            if (best < 0 || rk < best_rank) { best = i; best_rank = rk; }
+        }
+        if (best < 0) break;
+        done[best] = 1;
+        jobs[n].id = g->slots[best].id;
+        jobs[n].slot = (uint8_t)best;
         jobs[n].generation = g->generation;
         n++;
     }
     return n;
 }
 
-// ---- init ------------------------------------------------------------------
-void grid_init(tile_grid_t *g, uint16_t *const *bufs, tile_id_t center) {
+void grid_init(tile_grid_t *g, uint16_t *const *bufs, tile_id_t origin) {
     memset(g, 0, sizeof *g);
-    g->center = center;
+    g->origin = origin;
     g->generation = 1;
     for (int r = 0; r < GRID_N; r++)
         for (int c = 0; c < GRID_N; c++) {
             int i = r * GRID_N + c;
-            g->slots[i].id = grid_tile_at(center, r - GRID_MID, c - GRID_MID);
+            g->slots[i].id = grid_tile_at(origin, r, c);
             g->slots[i].pixels = bufs[i];
             g->slots[i].generation = g->generation;
             g->slots[i].state = grid_id_valid(g->slots[i].id)
@@ -84,7 +97,7 @@ int grid_shift(tile_grid_t *g, int dx, int dy,
     memset(reused, 0, sizeof reused);
 
     g->generation++;
-    g->center = grid_tile_at(g->center, dy, dx);
+    g->origin = grid_tile_at(g->origin, dy, dx);
 
     int needs[GRID_COUNT];
     memset(needs, 0, sizeof needs);
@@ -97,7 +110,7 @@ int grid_shift(tile_grid_t *g, int dx, int dy,
             int dst = r * GRID_N + c;
             int sr = r + dy, sc = c + dx;
 
-            g->slots[dst].id = grid_tile_at(g->center, r - GRID_MID, c - GRID_MID);
+            g->slots[dst].id = grid_tile_at(g->origin, r, c);
 
             if (sr >= 0 && sr < GRID_N && sc >= 0 && sc < GRID_N) {
                 int src = sr * GRID_N + sc;
@@ -137,17 +150,17 @@ int grid_shift(tile_grid_t *g, int dx, int dy,
 }
 
 // ---- zoom ------------------------------------------------------------------
-int grid_set_zoom(tile_grid_t *g, tile_id_t new_center,
+int grid_set_zoom(tile_grid_t *g, tile_id_t new_origin,
                   render_job_t *jobs, int max_jobs)
 {
     g->generation++;
-    g->center = new_center;
+    g->origin = new_origin;
 
     int needs[GRID_COUNT];
     for (int r = 0; r < GRID_N; r++)
         for (int c = 0; c < GRID_N; c++) {
             int i = r * GRID_N + c;
-            g->slots[i].id = grid_tile_at(new_center, r - GRID_MID, c - GRID_MID);
+            g->slots[i].id = grid_tile_at(new_origin, r, c);
             g->slots[i].generation = g->generation;
             if (grid_id_valid(g->slots[i].id)) {
                 g->slots[i].state = TILE_PENDING;
@@ -167,19 +180,37 @@ int grid_set_zoom(tile_grid_t *g, tile_id_t new_center,
 void grid_drift(tile_grid_t *g, double frac_x, double frac_y,
                 int *dx, int *dy)
 {
-    // frac_* are fractional tile coords at the grid's zoom. The centre tile
-    // spans [center.x, center.x+1) x [center.y, center.y+1).
-    double rx = frac_x - (double)g->center.x;
-    double ry = frac_y - (double)g->center.y;
+    // The canvas centre sits at origin + GRID_N/2 in tile units. The marker
+    // is allowed to wander half a tile either side of it before the grid
+    // moves. For an odd grid that band is exactly the middle tile, which is
+    // the behaviour this had before even sizes were supported.
+    double mid = (double)GRID_N / 2.0;
+    double rx = frac_x - ((double)g->origin.x + mid);
+    double ry = frac_y - ((double)g->origin.y + mid);
 
-    *dx = (rx < 0.0) ? -1 : (rx >= 1.0) ? 1 : 0;
-    *dy = (ry < 0.0) ? -1 : (ry >= 1.0) ? 1 : 0;
+    *dx = (rx < -0.5) ? -1 : (rx >= 0.5) ? 1 : 0;
+    *dy = (ry < -0.5) ? -1 : (ry >= 0.5) ? 1 : 0;
 
     // A single fix can jump more than one tile (tunnel exit, cold-start
     // relocate). Clamp to +/-1 here; the caller loops or forces a re-centre.
 }
 
 // ---- worker commit ---------------------------------------------------------
+int grid_commit_swap(tile_grid_t *g, const render_job_t *job,
+                     tile_state_t result, uint16_t *fresh, uint16_t **recycled)
+{
+    *recycled = fresh;                       // stale by default
+    if (job->slot >= GRID_COUNT) return 0;
+    subtile_t *s = &g->slots[job->slot];
+    if (job->generation != g->generation) return 0;
+    if (!same_tile(s->id, job->id))       return 0;
+
+    *recycled = s->pixels;
+    s->pixels = fresh;
+    s->state  = result;
+    return 1;
+}
+
 int grid_commit(tile_grid_t *g, const render_job_t *job, tile_state_t result) {
     if (job->slot >= GRID_COUNT) return 0;
     subtile_t *s = &g->slots[job->slot];

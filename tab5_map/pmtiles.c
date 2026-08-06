@@ -148,7 +148,7 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
         return PMT_OK;
     }
 
-    if (len > p->raw_cap) return PMT_ENOMEM;
+    if (len > p->raw_cap) { p->need_raw = len; return PMT_ENOMEM; }
     if (p->read(p->io_ctx, off, len, p->raw_buf) != 0) return PMT_EIO;
 
     const uint8_t *src = p->raw_buf;
@@ -156,7 +156,7 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
     uint32_t dec_len = p->dir_cap;
 
     if (p->hdr.internal_compression == PMT_COMPRESS_NONE) {
-        if (src_len > p->dir_cap) return PMT_ENOMEM;
+        if (src_len > p->dir_cap) { p->need_dir = src_len; return PMT_ENOMEM; }
         memcpy(p->dir_buf, src, src_len);
         dec_len = src_len;
     } else {
@@ -312,7 +312,7 @@ pmt_err_t pmt_get(pmt_t *p, uint8_t z, uint32_t x, uint32_t y,
     uint64_t off; uint32_t len;
     pmt_err_t e = pmt_find(p, z, x, y, &off, &len);
     if (e != PMT_OK) return e;
-    if (len > *dst_len) return PMT_ENOMEM;
+    if (len > *dst_len) { p->need_raw = len; return PMT_ENOMEM; }
     if (p->read(p->io_ctx, off, len, dst) != 0) return PMT_EIO;
     *dst_len = len;
     return PMT_OK;

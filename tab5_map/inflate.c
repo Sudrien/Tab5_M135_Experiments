@@ -252,7 +252,18 @@ inf_err_t inflate_raw(const uint8_t *in, uint32_t in_len,
     s.in = in; s.in_len = in_len;
     s.out = out; s.out_cap = *out_len;
 
-    static huff_t lit, dist;   // ~1.6 KiB each; static keeps them off the stack
+    // On the stack, not static.
+    //
+    // These were static to keep ~3.2 KiB off the stack, which quietly made
+    // the decoder non-reentrant. Two tasks inflating at once then shared one
+    // set of Huffman tables, and the second call rebuilt them underneath the
+    // first - producing a "corrupt stream" on input that is perfectly valid.
+    //
+    // The cost is that a caller needs roughly 3.5 KiB of stack headroom. That
+    // is cheaper than the alternatives: a lock would make a portable core
+    // depend on a threading API, and a per-call allocation would put malloc
+    // in the hot path.
+    huff_t lit, dist;
     int final = 0;
 
     do {
@@ -370,6 +381,13 @@ inf_err_t inflate_auto(const uint8_t *in, uint32_t in_len,
 inf_err_t inflate_auto_fast(const uint8_t *in, uint32_t in_len,
                             uint8_t *out, uint32_t *out_len) {
     return inflate_wrapped(in, in_len, out, out_len, 0);
+}
+
+uint32_t gzip_isize(const uint8_t *in, uint32_t in_len) {
+    if (in_len < 18 || in[0] != 0x1F || in[1] != 0x8B) return 0;
+    const uint8_t *t = in + in_len - 4;
+    return (uint32_t)t[0] | ((uint32_t)t[1] << 8) |
+           ((uint32_t)t[2] << 16) | ((uint32_t)t[3] << 24);
 }
 
 const char *inflate_strerror(inf_err_t e) {

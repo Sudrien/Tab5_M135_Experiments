@@ -42,6 +42,12 @@ inf_err_t inflate_auto(const uint8_t *in, uint32_t in_len,
 inf_err_t inflate_auto_fast(const uint8_t *in, uint32_t in_len,
                             uint8_t *out, uint32_t *out_len);
 
+// Uncompressed size recorded in a gzip trailer, or 0 if the input is not
+// gzip or is too short. Exact, and available before inflating - which turns
+// "output buffer too small" from something you discover by failing into
+// something you can size for.
+uint32_t gzip_isize(const uint8_t *in, uint32_t in_len);
+
 const char *inflate_strerror(inf_err_t e);
 
 #ifdef __cplusplus

@@ -12,7 +12,7 @@ It could probably be 2mm.
 This code is Claude Opus 5's attempt to get new sensors working. My compile flags for the tab5 are
 
 ```
-arduino-cli compile --fqbn "esp32:esp32:esp32p4:FlashSize=16M,PSRAM=enabled,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,USBMode=hwcdc" . && arduino-cli upload --fqbn "esp32:esp32:esp32p4:FlashSize=16M,PSRAM=enabled,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,USBMode=hwcdc" --port /dev/ttyACM0 . && sleep 2 && arduino-cli monitor --port /dev/ttyACM0 --config baudrate=115200
+arduino-cli compile --fqbn "esp32:esp32:m5stack_tab5:FlashSize=16M,PSRAM=enabled,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,USBMode=hwcdc" . && arduino-cli upload --fqbn "esp32:esp32:m5stack_tab5:FlashSize=16M,PSRAM=enabled,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,USBMode=hwcdc" --port /dev/ttyACM0 . && sleep 2 && arduino-cli monitor --port /dev/ttyACM0 --config baudrate=115200
 
 ```
 

@@ -36,10 +36,14 @@ void rs_clear(rs_t *r, uint16_t color) {
 }
 
 // ---- coordinate transform --------------------------------------------------
-// MVT tile coords (0..extent) -> output pixels, in RS_FRAC_BITS fixed point.
-static inline int32_t to_fx(const rs_t *r, int32_t v) {
-    // (v * w / extent) << FRAC, arranged to keep intermediates in range.
-    return (int32_t)(((int64_t)v * r->w << RS_FRAC_BITS) / r->extent);
+// MVT tile coords -> output pixels, in RS_FRAC_BITS fixed point, mapping the
+// source sub-rectangle onto the full output surface. Separate x and y because
+// the sub-rectangle has an origin on each axis.
+static inline int32_t to_fx_x(const rs_t *r, int32_t v) {
+    return (int32_t)(((int64_t)(v - r->src_x0) * r->w << RS_FRAC_BITS) / r->src_span);
+}
+static inline int32_t to_fx_y(const rs_t *r, int32_t v) {
+    return (int32_t)(((int64_t)(v - r->src_y0) * r->h << RS_FRAC_BITS) / r->src_span);
 }
 
 // ---- edge accumulation -----------------------------------------------------
@@ -60,10 +64,10 @@ static void add_edge(rs_t *r, int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
 
 static void add_ring(rs_t *r, const int32_t *pts, uint32_t n) {
     if (n < 2) return;
-    int32_t px = to_fx(r, pts[0]), py = to_fx(r, pts[1]);
+    int32_t px = to_fx_x(r, pts[0]), py = to_fx_y(r, pts[1]);
     int32_t fx = px, fy = py;
     for (uint32_t i = 1; i < n; i++) {
-        int32_t cx = to_fx(r, pts[i * 2]), cy = to_fx(r, pts[i * 2 + 1]);
+        int32_t cx = to_fx_x(r, pts[i * 2]), cy = to_fx_y(r, pts[i * 2 + 1]);
         add_edge(r, px, py, cx, cy);
         px = cx; py = cy;
     }
@@ -357,9 +361,9 @@ static void stroke_path(rs_t *r, const int32_t *pts, uint32_t n,
     if (n < 2) return;
     const int32_t MIN_STEP = RS_ONE / 2;      // half a pixel, fixed point
 
-    int32_t px = to_fx(r, pts[0]), py = to_fx(r, pts[1]);
+    int32_t px = to_fx_x(r, pts[0]), py = to_fx_y(r, pts[1]);
     for (uint32_t i = 1; i < n; i++) {
-        int32_t cx = to_fx(r, pts[i * 2]), cy = to_fx(r, pts[i * 2 + 1]);
+        int32_t cx = to_fx_x(r, pts[i * 2]), cy = to_fx_y(r, pts[i * 2 + 1]);
         int32_t adx = cx > px ? cx - px : px - cx;
         int32_t ady = cy > py ? cy - py : py - cy;
         if (i + 1 < n && adx < MIN_STEP && ady < MIN_STEP) continue;
@@ -380,6 +384,8 @@ void rs_flush(rs_t *r) {
 int rs_part(void *ctx, const mvt_part_t *part) {
     rs_t *r = ctx;
     r->extent = (int32_t)part->layer->extent;
+    // A caller that has not asked for a sub-rectangle gets the whole tile.
+    if (r->src_span <= 0) { r->src_x0 = 0; r->src_y0 = 0; r->src_span = r->extent; }
 
     const rs_style_t *st = (part->style < r->n_styles)
                            ? &r->styles[part->style] : NULL;
@@ -419,8 +425,8 @@ int rs_part(void *ctx, const mvt_part_t *part) {
         r->edge_n = 0;
         int32_t rad = (st->stroke_w ? st->stroke_w : 3) << RS_FRAC_BITS;
         for (uint32_t i = 0; i < part->n_pts; i++) {
-            int32_t cx = to_fx(r, part->pts[i * 2]);
-            int32_t cy = to_fx(r, part->pts[i * 2 + 1]);
+            int32_t cx = to_fx_x(r, part->pts[i * 2]);
+            int32_t cy = to_fx_y(r, part->pts[i * 2 + 1]);
             add_edge(r, cx, cy - rad, cx + rad, cy);
             add_edge(r, cx + rad, cy, cx, cy + rad);
             add_edge(r, cx, cy + rad, cx - rad, cy);

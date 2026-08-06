@@ -57,9 +57,20 @@ typedef struct {
     uint16_t *px;         // RGB565 target, w*h
     int32_t   w, h;
 
-    // Source coordinate span, i.e. the MVT layer extent. Geometry is scaled
-    // by (w / extent); a tile is square so one factor serves both axes.
+    // Source coordinate span, i.e. the MVT layer extent.
     int32_t   extent;
+
+    // Sub-rectangle of the tile's coordinate space to draw, in extent units.
+    // Defaults (0, 0, extent) render the whole tile, which is the ordinary
+    // case. Setting a smaller span renders one quadrant - or sixteenth - of
+    // the tile across the full output surface.
+    //
+    // This is what lets a lower-zoom tile supply several subtiles: one z13
+    // tile drawn as four quadrants covers the same ground at the same pixel
+    // density as four z14 tiles, while being a quarter of the download. The
+    // limit is that the geometry was simplified for z13, so past about 2x the
+    // intended density the simplification starts to show.
+    int32_t   src_x0, src_y0, src_span;
 
     // Edge accumulator for the polygon currently being assembled.
     rs_edge_t *edges;

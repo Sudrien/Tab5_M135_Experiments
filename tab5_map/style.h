@@ -13,7 +13,13 @@ enum {
 extern rs_style_t STYLES[S_COUNT];
 extern const char *DRAW_ORDER[];
 extern const int   N_DRAW_ORDER;
-void    style_init(int px);
+// `dark` selects the night palette. Changing it invalidates every rendered
+// tile, since the colours are baked in at rasterise time.
+void    style_init(int px, int dark);
+int     style_is_dark();
+
+// Background behind the map, matching the active palette.
+uint16_t style_background();
 uint8_t style_lookup(void *ctx, const mvt_layer_t *l, const char *s, uint32_t n);
 #ifdef __cplusplus
 }

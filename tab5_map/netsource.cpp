@@ -1,0 +1,735 @@
+// netsource.cpp
+
+#include "netsource.h"
+#include <Arduino.h>
+#include <SD.h>
+#include <SD_MMC.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <esp_sntp.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <esp_timer.h>
+
+#include "tilecache.h"
+#include "mapconfig.h"
+
+extern "C" {
+  #include "pmtiles.h"
+  #include "inflate.h"
+}
+
+// WHERE TILES COME FROM
+//
+// Protomaps explicitly discourage hotlinking their build bucket and warn that
+// the URLs may move: the documented guidance is to copy the tileset to your
+// own cloud storage and serve it from there. A single hobby device is
+// negligible traffic, but the right thing - and the thing that will not break
+// when they reorganise - is to point this at storage you control.
+//
+// Any host that answers HTTP range requests works, since PMTiles needs
+// nothing else. Cloudflare R2, S3, or a file on a home server all qualify.
+//
+// TILE_BASE is the directory; the archive name is appended. Leave it as the
+// upstream bucket for evaluation, then change it once you have your own copy.
+#ifndef TILE_BASE
+#define TILE_BASE "https://build.protomaps.com/"
+#endif
+
+// When PINNED_BUILD is set, that archive is used verbatim and no date probing
+// happens. Protomaps retain the latest build of each patch version
+// indefinitely, unlike dailies which age out after about a week - so a pinned
+// version is the stable choice, and the only sensible one when serving from
+// your own storage.
+//   e.g. #define PINNED_BUILD "v4.3.0"
+#ifndef PINNED_BUILD
+#define PINNED_BUILD ""
+#endif
+
+static const char *BUILD_HOST   = TILE_BASE;
+static const char *CACHE_ROOT   = "/t";
+static const char *MANIFEST     = "/t/build.txt";
+static const uint32_t REFRESH_DAYS = 30;
+
+// Index entries held in PSRAM: 16 bytes each, so 200k tiles costs 3.2 MB.
+// A region at z15 comfortably fits; the whole planet would not, which is
+// what the build-scoped cache is for.
+static const uint32_t CACHE_MAX_ENTRIES = CACHE_MAX_ENTRIES_CFG;
+
+// Protomaps retains about a week of daily builds, so probing more than that
+// is pointless - if nothing in the last 8 days answers, the network or the
+// service is down, not the date arithmetic.
+static const int MAX_PROBE_DAYS = 8;
+
+static fs::FS *g_fs = nullptr;
+static pmt_t   g_local;                 // world.pmtiles, offline floor
+static bool    g_local_ok = false;
+static pmt_t   g_remote;                // current build, over HTTP
+static bool    g_remote_ok = false;
+static char    g_build[16] = "";
+static uint32_t g_adopted_epochdays = 0;
+static uint32_t g_today_epochdays = 0;
+static NetStats g_stats;
+// Serialises access to the pmt_t readers and their scratch buffers.
+//
+// A pmt_t is explicitly not thread-safe - it owns a directory buffer, a raw
+// buffer and a root cache that a lookup writes through. Three tasks reach
+// netsource_get: the render worker, the radius prefetch and the world floor.
+// Without this they interleave inside a single lookup, which shows up as
+// "decompress failed" (another task overwrote raw_buf mid-inflate) and
+// "read failed" (the shared file position moved under a read).
+//
+// Held for a whole tile fetch, so a background task can delay the renderer by
+// up to one tile. That is the right trade: the alternative is a second set of
+// buffers per task, and there is not enough PSRAM left for it.
+static SemaphoreHandle_t g_lock = nullptr;
+
+// Scratch owned by this module; only the render worker calls in here.
+static uint8_t *l_dir = nullptr, *l_raw = nullptr, *l_root = nullptr;
+static uint8_t *r_dir = nullptr, *r_raw = nullptr, *r_root = nullptr;
+static uint32_t l_cap = 0, r_cap = 0;
+
+// The header describes the root directory but says nothing about leaf sizes,
+// and on a planet-scale archive the leaves are what matter: the root loaded
+// fine at 15 KB while every leaf lookup failed. Rather than guess again, the
+// reader now reports how many bytes it needed, and the buffers grow on
+// demand up to a ceiling.
+static const uint32_t DIR_CAP_MIN = 256 * 1024;
+static const uint32_t DIR_CAP_MAX = 4 * 1024 * 1024;
+
+// Directories are varint runs under gzip, which typically compresses 2-3x, so
+// 4x the stored size is comfortable headroom for the decompressed form.
+// Larger multipliers cost real PSRAM here: this scratch is allocated twice,
+// once for the local archive and once for the remote.
+static const uint32_t DIR_EXPAND = 4;
+
+// Grow a reader's scratch to suit the archive it just opened. Returns false
+// only if the allocation fails outright.
+static bool fit_buffers(pmt_t *p, uint8_t **raw, uint8_t **dir, uint8_t **root,
+                        uint32_t *cap, const char *what, uint32_t want)
+{
+    if (want < DIR_CAP_MIN) want = DIR_CAP_MIN;
+    if (want > DIR_CAP_MAX) {
+        Serial.printf("netsource: %s directory needs %lu bytes, beyond the %lu cap\n",
+                      what, (unsigned long)want, (unsigned long)DIR_CAP_MAX);
+        want = DIR_CAP_MAX;
+    }
+    if (want <= *cap) return true;
+
+    uint32_t dcap = want * DIR_EXPAND;
+    if (dcap > DIR_CAP_MAX * DIR_EXPAND) dcap = DIR_CAP_MAX * DIR_EXPAND;
+
+    free(*raw); free(*dir); free(*root);
+    *raw  = (uint8_t *)ps_malloc(want);
+    *dir  = (uint8_t *)ps_malloc(dcap);
+    *root = (uint8_t *)ps_malloc(dcap);
+    if (!*raw || !*dir || !*root) {
+        Serial.printf("netsource: %s buffer alloc failed (%lu / %lu)\n",
+                      what, (unsigned long)want, (unsigned long)dcap);
+        return false;
+    }
+    *cap = want;
+    p->raw_buf = *raw; p->raw_cap = want;
+    p->dir_buf = *dir; p->dir_cap = dcap;
+    p->root_cache = *root; p->root_cache_cap = dcap;
+    p->root_cache_len = 0;
+
+    Serial.printf("netsource: %s scratch -> raw %lu KB, dir %lu KB\n",
+                  what, (unsigned long)(want / 1024), (unsigned long)(dcap / 1024));
+    return true;
+}
+
+// ---- date helpers ----------------------------------------------------------
+// Days since an arbitrary epoch. Only differences matter, so the zero point
+// is irrelevant as long as it is consistent.
+static uint32_t epoch_days(int y, int m, int d) {
+    if (m <= 2) { y -= 1; m += 12; }
+    long era = (y >= 0 ? y : y - 399) / 400;
+    long yoe = y - era * 400;
+    long doy = (153 * (m - 3) + 2) / 5 + d - 1;
+    long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return (uint32_t)(era * 146097 + doe + 719468);
+}
+
+static void days_to_ymd(uint32_t z, int *y, int *m, int *d) {
+    long zz = (long)z - 719468;
+    long era = (zz >= 0 ? zz : zz - 146096) / 146097;
+    long doe = zz - era * 146097;
+    long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    long yy = yoe + era * 400;
+    long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    long mp = (5 * doy + 2) / 153;
+    *d = (int)(doy - (153 * mp + 2) / 5 + 1);
+    *m = (int)(mp < 10 ? mp + 3 : mp - 9);
+    *y = (int)(yy + (*m <= 2));
+}
+
+// Take the date from the system clock - but only once SNTP has actually
+// synchronised.
+//
+// A plausibility check on the value is not enough. M5Unified seeds system
+// time from the on-board RTC at startup, and an RTC that has never been set
+// can hold an arbitrary date: a battery-backed chip reading years into the
+// future looks entirely valid to any range test, and would send build
+// discovery probing for archives that will not exist for years.
+//
+// Asking the SNTP client whether it has completed a sync is the only
+// trustworthy signal. The year bound below is a backstop against a malicious
+// or broken time server, not the primary check.
+bool netsource_set_date_from_clock() {
+    if (sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED) return false;
+
+    time_t now = time(nullptr);
+    struct tm t;
+    gmtime_r(&now, &t);
+    int year = t.tm_year + 1900;
+    if (year < 2026 || year > 2036) {
+        Serial.printf("netsource: SNTP returned an implausible year (%d), ignoring\n",
+                      year);
+        return false;
+    }
+    g_today_epochdays = epoch_days(year, t.tm_mon + 1, t.tm_mday);
+    Serial.printf("netsource: date %04d-%02d-%02d from SNTP\n",
+                  year, t.tm_mon + 1, t.tm_mday);
+    return true;
+}
+
+void netsource_set_date(const char *ddmmyy) {
+    if (!ddmmyy || strlen(ddmmyy) < 6) return;
+    int d = (ddmmyy[0]-'0')*10 + (ddmmyy[1]-'0');
+    int m = (ddmmyy[2]-'0')*10 + (ddmmyy[3]-'0');
+    int y = 2000 + (ddmmyy[4]-'0')*10 + (ddmmyy[5]-'0');
+    if (d < 1 || d > 31 || m < 1 || m > 12) return;
+    g_today_epochdays = epoch_days(y, m, d);
+}
+
+// ---- HTTP range read -------------------------------------------------------
+static String remote_url() { return String(BUILD_HOST) + g_build + ".pmtiles"; }
+
+static int http_range(const String &url, uint64_t off, uint32_t len, uint8_t *dst) {
+    if (WiFi.status() != WL_CONNECTED) return -1;
+
+    HTTPClient http;
+    // Deliberately NOT reusing the connection.
+    //
+    // With reuse, a request whose body is not fully drained leaves those
+    // bytes in the socket, and the next request reads them as its own
+    // response - which surfaces as a tile that fetches "successfully" and
+    // then fails to inflate. Every error path here ends the request early,
+    // so that window is wide open.
+    //
+    // A fresh connection per tile costs a handshake, which also keeps the
+    // request rate politely low against a bucket we are told not to hotlink.
+    http.setReuse(false);
+    http.setTimeout(15000);
+    if (!http.begin(url)) return -1;
+
+    char range[64];
+    snprintf(range, sizeof range, "bytes=%llu-%llu",
+             (unsigned long long)off, (unsigned long long)(off + len - 1));
+    http.addHeader("Range", range);
+
+    uint64_t t0 = esp_timer_get_time();
+    int code = http.GET();
+    // 206 is the expected answer. A 200 means the server ignored the Range
+    // header and is about to send the entire multi-gigabyte archive, which
+    // must be refused rather than read.
+    if (code != HTTP_CODE_PARTIAL_CONTENT) {
+        if (code == HTTP_CODE_OK)
+            Serial.println("netsource: server ignored Range header, refusing");
+        http.end();
+        return -1;
+    }
+
+    // A 206 must carry exactly the requested range; anything else means the
+    // response does not correspond to this request.
+    int clen = http.getSize();
+    if (clen >= 0 && (uint32_t)clen != len) {
+        Serial.printf("netsource: range asked %lu got %d bytes, discarding\n",
+                      (unsigned long)len, clen);
+        http.end();
+        return -1;
+    }
+
+    WiFiClient *s = http.getStreamPtr();
+    uint32_t got = 0;
+    uint32_t deadline = millis() + 15000;
+    uint32_t reads = 0;
+    while (got < len && millis() < deadline) {
+        reads++;
+        size_t avail = s->available();
+        if (!avail) { delay(2); continue; }
+        int n = s->readBytes(dst + got, min((size_t)(len - got), avail));
+        if (n <= 0) break;
+        got += n;
+    }
+    // Drain whatever is left before closing. Harmless without reuse, and it
+    // stops a half-read response poisoning anything if reuse is ever enabled.
+    uint32_t leftover = 0;
+    while (s->available()) { s->read(); leftover++; }
+    http.end();
+    g_stats.last_fetch_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    if (got != len || leftover) {
+        Serial.printf("netsource: range %llu+%lu -> got %lu in %lu reads, "
+                      "%lu left over\n", (unsigned long long)off,
+                      (unsigned long)len, (unsigned long)got,
+                      (unsigned long)reads, (unsigned long)leftover);
+    }
+    if (got != len) return -1;
+    g_stats.bytes_fetched += got;
+    return 0;
+}
+
+static int net_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
+    (void)ctx;
+    return http_range(remote_url(), off, len, dst);
+}
+
+// ---- SD-backed pmtiles read ------------------------------------------------
+static File g_localFile;
+static int sd_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
+    (void)ctx;
+    if (!g_localFile.seek((uint32_t)off)) return -1;
+    return g_localFile.read(dst, len) == (int)len ? 0 : -1;
+}
+
+static int gz_inflate(void *ctx, uint8_t codec, const uint8_t *src,
+                      uint32_t src_len, uint8_t *dst, uint32_t *dst_len) {
+    (void)ctx;
+    if (codec != PMT_COMPRESS_GZIP) return -1;
+    return inflate_auto(src, src_len, dst, dst_len) == INF_OK ? 0 : -1;
+}
+
+// ---- cache -----------------------------------------------------------------
+// Backed by tilecache: one append-only blob plus an in-PSRAM index, rather
+// than a file per tile. See tilecache.h for why - briefly, thousands of small
+// creates is the pattern most likely to lose a FAT32 filesystem to a power
+// cut, and wastes most of each 32 KB cluster besides.
+
+static bool cache_read(uint8_t z, uint32_t x, uint32_t y,
+                       uint8_t *dst, uint32_t *len) {
+    return tilecache_get(z, x, y, dst, len);
+}
+
+static void cache_write(uint8_t z, uint32_t x, uint32_t y,
+                        const uint8_t *src, uint32_t len) {
+    tilecache_put(z, x, y, src, len);
+}
+
+// Zero length records "the archive genuinely has no tile here", so ocean and
+// out-of-coverage areas are not re-requested on every pass.
+static void cache_write_empty(uint8_t z, uint32_t x, uint32_t y) {
+    tilecache_put(z, x, y, nullptr, 0);
+}
+
+static bool cache_is_empty_marker(uint8_t z, uint32_t x, uint32_t y) {
+    uint32_t n = 0;
+    uint8_t dummy;
+    // A hit with zero length is the marker; a hit with data returns false
+    // here because n would exceed the zero capacity passed in.
+    return tilecache_get(z, x, y, &dummy, &n) && n == 0;
+}
+
+// ---- build discovery -------------------------------------------------------
+static bool probe_build(const char *date) {
+    String url = String(BUILD_HOST) + date + ".pmtiles";
+    uint8_t hdr[16];
+    HTTPClient http;
+    http.setTimeout(8000);
+    if (!http.begin(url)) return false;
+    http.addHeader("Range", "bytes=0-15");
+    int code = http.GET();
+    bool ok = false;
+    if (code == HTTP_CODE_PARTIAL_CONTENT) {
+        WiFiClient *s = http.getStreamPtr();
+        uint32_t t = millis();
+        int got = 0;
+        while (got < 16 && millis() - t < 5000) {
+            if (s->available()) got += s->readBytes(hdr + got, 16 - got);
+            else delay(2);
+        }
+        ok = (got == 16 && memcmp(hdr, "PMTiles", 7) == 0 && hdr[7] == 3);
+    }
+    http.end();
+    return ok;
+}
+
+static bool discover_build(char *out, size_t n) {
+    if (!g_today_epochdays) netsource_set_date_from_clock();
+    if (!g_today_epochdays) {
+        Serial.println("netsource: no date yet (needs SNTP or a GNSS fix)");
+        return false;
+    }
+    for (int back = 0; back < MAX_PROBE_DAYS; back++) {
+        int y, m, d;
+        days_to_ymd(g_today_epochdays - back, &y, &m, &d);
+        char date[16];
+        snprintf(date, sizeof date, "%04d%02d%02d", y, m, d);
+        Serial.printf("netsource: probing build %s ... ", date);
+        if (probe_build(date)) {
+            Serial.println("ok");
+            snprintf(out, n, "%s", date);
+            return true;
+        }
+        Serial.println("no");
+    }
+    return false;
+}
+
+static void manifest_save() {
+    File f = g_fs->open(MANIFEST, FILE_WRITE);
+    if (!f) return;
+    f.printf("%s\n%lu\n", g_build, (unsigned long)g_adopted_epochdays);
+    f.close();
+}
+
+static bool manifest_load() {
+    File f = g_fs->open(MANIFEST, FILE_READ);
+    if (!f) return false;
+    String a = f.readStringUntil('\n'); a.trim();
+    String b = f.readStringUntil('\n'); b.trim();
+    f.close();
+    if (a.length() != 8) return false;
+    snprintf(g_build, sizeof g_build, "%s", a.c_str());
+    g_adopted_epochdays = (uint32_t)b.toInt();
+    return true;
+}
+
+// Defined below, after the build-discovery helpers it depends on.
+static bool maybe_refresh();
+
+// ---- world bootstrap -------------------------------------------------------
+// There is no server-side extract, so the device cannot ask for "just the low
+// zooms" as a single download. It does not need to: the whole pyramid from
+// z0 to z6 is 5461 tiles, and pulling them through the ordinary cache path
+// leaves exactly the offline floor that world.pmtiles was going to provide.
+//
+// One HTTP round trip per tile makes this slow - several minutes - so it runs
+// once, in the background, and reports progress. Everything it fetches is a
+// normal cache entry, so an interrupted run simply resumes where it stopped.
+bool netsource_prefetch_world(uint8_t maxz, uint8_t *buf, uint32_t cap,
+                              void (*progress)(uint32_t done, uint32_t total))
+{
+    if (!maybe_refresh() || !g_remote_ok) return false;
+
+    uint32_t total = 0;
+    for (uint8_t z = 0; z <= maxz; z++) total += 1u << (2 * z);
+
+    uint32_t done = 0, fetched = 0, skipped = 0;
+    for (uint8_t z = 0; z <= maxz; z++) {
+        uint32_t n = 1u << z;
+        for (uint32_t x = 0; x < n; x++) {
+            for (uint32_t y = 0; y < n; y++) {
+                done++;
+                // Already cached, including negative markers, so a resumed
+                // run costs an SD stat rather than a round trip.
+                uint32_t got = cap;
+                if (cache_is_empty_marker(z, x, y) ||
+                    cache_read(z, x, y, buf, &got)) { skipped++; }
+                else {
+                    got = cap;
+                    bool net = false;
+                    if (netsource_get(z, x, y, buf, &got, &net)) fetched++;
+                }
+                if (progress && (done % 64) == 0) progress(done, total);
+                if (WiFi.status() != WL_CONNECTED) {
+                    Serial.println("netsource: link lost, prefetch paused");
+                    return false;
+                }
+            }
+        }
+        Serial.printf("netsource: z%u done (%lu fetched, %lu already cached)\n",
+                      z, (unsigned long)fetched, (unsigned long)skipped);
+    }
+    if (progress) progress(total, total);
+    return true;
+}
+
+// ---- public ----------------------------------------------------------------
+bool netsource_begin(const char *local_path) {
+    g_fs = (SD_MMC.cardType() != CARD_NONE) ? (fs::FS *)&SD_MMC : (fs::FS *)&SD;
+    g_lock = xSemaphoreCreateMutex();
+
+    l_raw  = (uint8_t *)ps_malloc(DIR_CAP_MIN);
+    l_dir  = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
+    l_root = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
+    r_raw  = (uint8_t *)ps_malloc(DIR_CAP_MIN);
+    r_dir  = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
+    r_root = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
+    if (!l_dir || !l_raw || !l_root || !r_dir || !r_raw || !r_root) return false;
+    l_cap = r_cap = DIR_CAP_MIN;
+
+    // Local floor.
+    g_localFile = g_fs->open(local_path, FILE_READ);
+    if (g_localFile) {
+        memset(&g_local, 0, sizeof g_local);
+        g_local.read = sd_read; g_local.inflate = gz_inflate;
+        g_local.dir_buf = l_dir; g_local.dir_cap = DIR_CAP_MIN * DIR_EXPAND;
+        g_local.raw_buf = l_raw; g_local.raw_cap = DIR_CAP_MIN;
+        g_local.root_cache = l_root; g_local.root_cache_cap = DIR_CAP_MIN * DIR_EXPAND;
+        g_local_ok = (pmt_open(&g_local) == PMT_OK);
+        if (g_local_ok)
+            g_local_ok = fit_buffers(&g_local, &l_raw, &l_dir, &l_root, &l_cap,
+                                     "local", (uint32_t)g_local.hdr.root_len);
+        Serial.printf("netsource: local %s z%u..%u %s\n", local_path,
+                      g_local.hdr.min_zoom, g_local.hdr.max_zoom,
+                      g_local_ok ? "ok" : "FAILED");
+    } else {
+        Serial.printf("netsource: %s not present\n", local_path);
+    }
+
+    manifest_load();
+    if (g_build[0]) {
+        Serial.printf("netsource: cached build %s\n", g_build);
+        tilecache_open(g_build, CACHE_MAX_ENTRIES);
+
+        // A blob whose records account for almost none of its size was
+        // damaged - by concurrent writes, or an interrupted one. Records past
+        // the damage are unreachable and their space is never reclaimed, so
+        // keeping it means a cache that only grows while holding nothing.
+        CacheStats cs;
+        tilecache_stats(&cs);
+        if (cs.blob_bytes > 1024 * 1024 && cs.entries < 32) {
+            Serial.printf("netsource: cache holds %lu entries in %lu KB - "
+                          "discarding it\n", (unsigned long)cs.entries,
+                          (unsigned long)(cs.blob_bytes / 1024));
+            tilecache_wipe();
+        }
+    }
+    return true;
+}
+
+static bool open_remote() {
+    if (!g_build[0] || WiFi.status() != WL_CONNECTED) return false;
+    memset(&g_remote, 0, sizeof g_remote);
+    g_remote.read = net_read; g_remote.inflate = gz_inflate;
+    g_remote.dir_buf = r_dir; g_remote.dir_cap = r_cap * DIR_EXPAND;
+    g_remote.raw_buf = r_raw; g_remote.raw_cap = r_cap;
+    g_remote.root_cache = r_root; g_remote.root_cache_cap = r_cap * DIR_EXPAND;
+    g_remote_ok = (pmt_open(&g_remote) == PMT_OK);
+    if (g_remote_ok) {
+        Serial.printf("netsource: remote build %s open, z%u..%u, root %lu B\n",
+                      g_build, g_remote.hdr.min_zoom, g_remote.hdr.max_zoom,
+                      (unsigned long)g_remote.hdr.root_len);
+        g_remote_ok = fit_buffers(&g_remote, &r_raw, &r_dir, &r_root, &r_cap,
+                                  "remote", (uint32_t)g_remote.hdr.root_len);
+    }
+    return g_remote_ok;
+}
+
+// The world floor is what stops a drive out of cached territory ending in a
+// blank screen: z0-6 is only 5461 tiles but covers the entire planet, so
+// there is always something to fall back to.
+static const char *WORLD_MARK = "/t/world.ok";
+static const char *WORLD_POS  = "/t/world.pos";
+
+bool netsource_world_ready() {
+    File f = g_fs->open(WORLD_MARK, FILE_READ);
+    if (!f) return false;
+    f.close();
+    return true;
+}
+
+void netsource_world_mark_done() {
+    File f = g_fs->open(WORLD_MARK, FILE_WRITE);
+    if (f) { f.printf("%s\n", g_build); f.close(); }
+    netsource_world_clear_pos();
+}
+
+void netsource_world_save_pos(uint8_t z, uint32_t x, uint32_t y) {
+    File f = g_fs->open(WORLD_POS, FILE_WRITE);
+    if (!f) return;
+    f.printf("%s %u %lu %lu\n", g_build, z,
+             (unsigned long)x, (unsigned long)y);
+    f.close();
+}
+
+bool netsource_world_load_pos(uint8_t *z, uint32_t *x, uint32_t *y) {
+    File f = g_fs->open(WORLD_POS, FILE_READ);
+    if (!f) return false;
+    char line[64] = {0};
+    int n = f.read((uint8_t *)line, sizeof line - 1);
+    f.close();
+    if (n <= 0) return false;
+
+    char build[16] = {0};
+    unsigned zz = 0, xx = 0, yy = 0;
+    if (sscanf(line, "%15s %u %u %u", build, &zz, &xx, &yy) != 4) return false;
+    // A checkpoint from a different build points into a cache that no longer
+    // exists, so it has to be discarded rather than trusted.
+    if (strcmp(build, g_build) != 0) {
+        Serial.printf("netsource: world checkpoint is from build %s, ignoring\n",
+                      build);
+        return false;
+    }
+    *z = (uint8_t)zz; *x = xx; *y = yy;
+    return true;
+}
+
+void netsource_world_clear_pos() {
+    if (g_fs) g_fs->remove(WORLD_POS);
+}
+
+bool netsource_refresh() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    // A pinned build never ages out, so there is nothing to discover.
+    if (PINNED_BUILD[0]) {
+        if (strcmp(g_build, PINNED_BUILD) != 0) {
+            snprintf(g_build, sizeof g_build, "%s", PINNED_BUILD);
+            manifest_save();
+        }
+        g_adopted_epochdays = g_today_epochdays;
+        return open_remote();
+    }
+
+    char found[16] = "";
+    if (!discover_build(found, sizeof found)) {
+        Serial.println("netsource: no live build found in the last 8 days");
+        return false;
+    }
+    if (strcmp(found, g_build) != 0) {
+        if (g_build[0]) {
+            // Offsets from one build mean nothing in another, so the whole
+            // cache goes. With a blob that is two file deletes rather than a
+            // recursive walk of thousands of entries.
+            char p[64];
+            Serial.printf("netsource: build %s -> %s, dropping old cache\n",
+                          g_build, found);
+            tilecache_close();
+            snprintf(p, sizeof p, "/t/%s.dat", g_build); g_fs->remove(p);
+            snprintf(p, sizeof p, "/t/%s.idx", g_build); g_fs->remove(p);
+        }
+        snprintf(g_build, sizeof g_build, "%s", found);
+    }
+    tilecache_open(g_build, CACHE_MAX_ENTRIES);
+    g_adopted_epochdays = g_today_epochdays;
+    manifest_save();
+    return open_remote();
+}
+
+static bool maybe_refresh() {
+    if (g_remote_ok) {
+        // A pinned build is deliberately frozen; only the daily channel ages.
+        if (PINNED_BUILD[0]) return true;
+        // Age out on schedule even while working, so a device left running
+        // does not quietly serve month-old geometry forever.
+        if (g_today_epochdays && g_adopted_epochdays &&
+            g_today_epochdays - g_adopted_epochdays >= REFRESH_DAYS) {
+            Serial.println("netsource: adopted build has aged out, refreshing");
+            g_remote_ok = false;
+            return netsource_refresh();
+        }
+        return true;
+    }
+    if (WiFi.status() != WL_CONNECTED) return false;
+    if (g_build[0] && open_remote()) return true;
+    return netsource_refresh();
+}
+
+static bool netsource_get_locked(uint8_t z, uint32_t x, uint32_t y,
+                                 uint8_t *dst, uint32_t *len, bool *from_net)
+{
+    if (from_net) *from_net = false;
+    uint32_t cap = *len;
+
+    // 1. cache
+    if (g_build[0]) {
+        if (cache_is_empty_marker(z, x, y)) { g_stats.misses++; return false; }
+        uint32_t n = cap;
+        if (cache_read(z, x, y, dst, &n)) { *len = n; g_stats.cache_hits++; return true; }
+    }
+
+    // 2. network
+    if (maybe_refresh() && g_remote_ok) {
+        g_stats.online = true;
+        uint64_t dbg_off = 0; uint32_t dbg_len = 0;
+        pmt_err_t fe = pmt_find(&g_remote, z, x, y, &dbg_off, &dbg_len);
+        if (fe == PMT_OK) {
+            static uint32_t shown = 0;
+            if (shown < 12) {
+                shown++;
+                Serial.printf("netsource: %u/%lu/%lu at offset %llu len %lu\n",
+                              z, (unsigned long)x, (unsigned long)y,
+                              (unsigned long long)dbg_off, (unsigned long)dbg_len);
+            }
+        }
+
+        uint32_t n = cap;
+        pmt_err_t e = pmt_get(&g_remote, z, x, y, dst, &n);
+
+        // A leaf directory larger than the current scratch is not an error,
+        // just a buffer that was sized before we knew what the archive
+        // contained. The reader reports what it needed; grow once and retry.
+        if (e == PMT_ENOMEM && g_remote.need_raw > r_cap &&
+            g_remote.need_raw <= DIR_CAP_MAX) {
+            Serial.printf("netsource: leaf needs %lu B, growing from %lu KB\n",
+                          (unsigned long)g_remote.need_raw,
+                          (unsigned long)(r_cap / 1024));
+            if (fit_buffers(&g_remote, &r_raw, &r_dir, &r_root, &r_cap,
+                            "remote", g_remote.need_raw)) {
+                n = cap;
+                e = pmt_get(&g_remote, z, x, y, dst, &n);
+            }
+        }
+
+        if (e == PMT_OK) {
+            cache_write(z, x, y, dst, n);
+            *len = n;
+            g_stats.net_hits++;
+            if (from_net) *from_net = true;
+            return true;
+        }
+        if (e == PMT_NOTFOUND) {
+            cache_write_empty(z, x, y);
+            g_stats.misses++;
+            return false;
+        }
+        g_stats.errors++;
+        {
+            static uint32_t logged = 0;
+            if (logged < 8) {
+                logged++;
+                Serial.printf("netsource: remote %u/%lu/%lu failed: %s",
+                              z, (unsigned long)x, (unsigned long)y,
+                              pmt_strerror(e));
+                if (e == PMT_ENOMEM)
+                    Serial.printf(" (needed %lu B)",
+                                  (unsigned long)g_remote.need_raw);
+                Serial.println();
+            }
+        }
+        // fall through to the local floor rather than failing outright
+    } else {
+        if (g_stats.online) Serial.println("netsource: gone offline");
+        g_stats.online = false;
+    }
+
+    // 3. local floor
+    if (g_local_ok) {
+        uint32_t n = cap;
+        if (pmt_get(&g_local, z, x, y, dst, &n) == PMT_OK) {
+            *len = n;
+            g_stats.local_hits++;
+            return true;
+        }
+    }
+    g_stats.misses++;
+    return false;
+}
+
+bool netsource_get(uint8_t z, uint32_t x, uint32_t y,
+                   uint8_t *dst, uint32_t *len, bool *from_net)
+{
+    if (!g_lock) return netsource_get_locked(z, x, y, dst, len, from_net);
+    if (xSemaphoreTake(g_lock, portMAX_DELAY) != pdTRUE) return false;
+    bool r = netsource_get_locked(z, x, y, dst, len, from_net);
+    xSemaphoreGive(g_lock);
+    return r;
+}
+
+void netsource_stats(NetStats *out) {
+    *out = g_stats;
+    snprintf(out->build, sizeof out->build, "%s", g_build);
+}

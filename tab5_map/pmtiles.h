@@ -105,6 +105,13 @@ typedef struct {
     uint8_t  *root_cache;      // optional; NULL disables
     uint32_t  root_cache_cap;
     uint32_t  root_cache_len;  // 0 = not yet populated
+
+    // Set whenever a call returns PMT_ENOMEM: the number of bytes that would
+    // have been required. Leaf directory sizes are not described anywhere in
+    // the header, so without this the caller has no way to size raw_buf
+    // except by guessing and retrying.
+    uint32_t  need_raw;        // bytes needed in raw_buf
+    uint32_t  need_dir;        // bytes needed in dir_buf
 } pmt_t;
 
 // ---- API -------------------------------------------------------------------
