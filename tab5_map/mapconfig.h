@@ -24,6 +24,29 @@
 #define SUBTILE_PX 1280
 #endif
 
+// ---- view following --------------------------------------------------------
+// The marker is kept inside a band in the middle of the screen rather than
+// pinned to the exact centre. Inside the band the view does not move at all,
+// so GPS noise moves the dot instead of shuffling the whole map - which at
+// HDOP 1.5 and 1.4 m/px is several pixels of jitter every fix.
+//
+// When the marker reaches the edge of the band the view follows exactly far
+// enough to hold it there, so there is no lurch and nothing to tune about
+// how it re-centres.
+//
+// Fraction of the visible area the band spans. 0.33 is the literal rule of
+// thirds; smaller means the map moves more often but the marker stays more
+// central.
+#ifndef MARKER_BAND
+#define MARKER_BAND 0.33f
+#endif
+
+// Radius reserved for the marker when repainting just its neighbourhood,
+// large enough to cover the circle and the heading needle.
+#ifndef MARKER_CLEAR_R
+#define MARKER_CLEAR_R 36
+#endif
+
 // ---- grid size -------------------------------------------------------------
 // Tiles held resident, GRID_N x GRID_N. May be even.
 //

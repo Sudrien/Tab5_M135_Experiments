@@ -42,6 +42,18 @@ static const uint32_t VAL_CAP   =  1024;
 static const uint32_t EDGE_CAP  = 16384;
 static const uint32_t XS_CAP    =  4096;
 
+// Screen geometry. The status bar owns the top strip and the buttons the
+// bottom one; the map is clipped out of both so they are not fighting over
+// the same pixels.
+static const int STATUS_H = 52;
+static const int FOOTER_H = 82;
+
+// pushImage handled pixel format for us; writePixels is lower level and takes
+// byte order explicitly. If red and blue come out exchanged, flip this.
+#ifndef BLIT_SWAP_BYTES
+#define BLIT_SWAP_BYTES false
+#endif
+
 // ---- state -----------------------------------------------------------------
 static tile_grid_t      g_grid;
 static SemaphoreHandle_t g_glock = nullptr;
@@ -93,8 +105,16 @@ static int64_t   g_coarse_retry_at = 0;
 // Spare buffer the worker renders into before swapping it into a slot.
 static uint16_t *g_spare = nullptr;
 
-// Marker position within the grid canvas, in output pixels.
-static double g_marker_gx = 0, g_marker_gy = 0;
+// Marker position in world coordinates (fractional tiles at the working
+// zoom), and the view's top-left corner in the same units.
+//
+// The view is held in world coordinates rather than canvas pixels so that a
+// grid shift - which moves the canvas origin by a whole tile - does not move
+// the picture. Converting to canvas pixels happens at draw time against the
+// current origin.
+static double g_marker_wx = 0, g_marker_wy = 0;
+static double g_view_wx = 0, g_view_wy = 0;
+static bool   g_view_set = false;
 
 // ---- rendering one tile ----------------------------------------------------
 static const char *g_want_layer = nullptr;
@@ -532,6 +552,58 @@ bool map_begin(const char *path, uint8_t zoom, int worker_core, int worker_prio)
     return true;
 }
 
+// Hold the marker inside a band in the middle of the visible area.
+//
+// The view only moves when the marker would leave the band, and then only far
+// enough to keep it on the boundary. Inside the band nothing moves at all,
+// which is what stops fix noise from shuffling the map.
+//
+// Everything is in world units (fractional tiles); the band is converted from
+// pixels once, here.
+static void view_follow() {
+    const int SW = M5.Display.width(), SH = M5.Display.height();
+    const int visTop = STATUS_H, visBot = SH - FOOTER_H;
+    const double visH = visBot - visTop;
+
+    // Band edges, as offsets from the top-left of the visible area.
+    double bx = SW * (1.0 - MARKER_BAND) / 2.0;
+    double by = visH * (1.0 - MARKER_BAND) / 2.0;
+    double bxLo = bx, bxHi = SW - bx;
+    double byLo = by, byHi = visH - by;
+
+    if (!g_view_set) {
+        g_view_wx = g_marker_wx - (SW / 2.0) / SUBTILE_PX;
+        g_view_wy = g_marker_wy - (visH / 2.0) / SUBTILE_PX;
+        g_view_set = true;
+        return;
+    }
+
+    double loX = g_marker_wx - bxHi / SUBTILE_PX;
+    double hiX = g_marker_wx - bxLo / SUBTILE_PX;
+    if (g_view_wx < loX) g_view_wx = loX;
+    if (g_view_wx > hiX) g_view_wx = hiX;
+
+    double loY = g_marker_wy - byHi / SUBTILE_PX;
+    double hiY = g_marker_wy - byLo / SUBTILE_PX;
+    if (g_view_wy < loY) g_view_wy = loY;
+    if (g_view_wy > hiY) g_view_wy = hiY;
+
+    // The canvas is finite, so the view cannot wander past its edges however
+    // the band would like it to. This takes priority - showing background is
+    // worse than the marker briefly leaving the band, and the grid shift that
+    // follows will restore it.
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    double ox = g_grid.origin.x, oy = g_grid.origin.y;
+    xSemaphoreGive(g_glock);
+
+    double maxX = ox + GRID_N - (double)SW / SUBTILE_PX;
+    double maxY = oy + GRID_N - visH / SUBTILE_PX;
+    if (g_view_wx < ox) g_view_wx = ox;
+    if (g_view_wx > maxX) g_view_wx = maxX;
+    if (g_view_wy < oy) g_view_wy = oy;
+    if (g_view_wy > maxY) g_view_wy = maxY;
+}
+
 // ---- job dispatch ----------------------------------------------------------
 static void enqueue(render_job_t *jobs, int n) {
     for (int i = 0; i < n; i++) {
@@ -563,6 +635,8 @@ static void recentre(const GnssFix &fix) {
     ensure_coarse(c);
     enqueue(jobs, n);
     g_centred = true;
+    // A fresh grid means the previous view may sit outside it entirely.
+    g_view_set = false;
     g_stats.shifts++;
 }
 
@@ -577,9 +651,9 @@ void map_update(const GnssFix &fix) {
 
     if (!g_centred) { recentre(fix); return; }
 
-    // Marker position on the 3x3 canvas, used by the compositor.
-    g_marker_gx = (p.x - (double)centre.x) * SUBTILE_PX;
-    g_marker_gy = (p.y - (double)centre.y) * SUBTILE_PX;
+    g_marker_wx = p.x;
+    g_marker_wy = p.y;
+    view_follow();
 
     int dx, dy;
     xSemaphoreTake(g_glock, portMAX_DELAY);
@@ -614,15 +688,6 @@ void map_set_zoom(uint8_t zoom, const GnssFix &fix) {
 }
 
 // ---- compositing -----------------------------------------------------------
-// Rows reserved for the status overlay. The map is clipped out of them so
-// the two are not fighting over the same pixels every frame.
-static const int STATUS_H = 52;
-
-// The prefetch button sits in the bottom-right corner and is redrawn every
-// frame, so the map painting over it would flicker exactly the way the
-// status bar used to. Reserving the strip is simpler than tracking damage.
-static const int FOOTER_H = 82;
-
 static bool g_visible = true;
 static bool g_force_redraw = true;
 
@@ -659,85 +724,34 @@ void map_set_dark(bool dark) {
 
 bool map_is_dark() { return style_is_dark(); }
 
-void map_draw(const GnssFix &fix) {
-    if (!g_visible) return;
+// Push one screen rectangle from whichever tiles cover it.
+//
+// Everything drawn from the tile buffers goes through here: a full repaint is
+// just the whole visible area, and erasing the marker is the two small rects
+// it moved between. Sending only the intersection matters - a 1280px tile
+// pushed whole is 3.3 MB, and doing that for a 70-pixel dot would cost more
+// than the entire visible area.
+static void blit_region(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
+                        int32_t canvas_x, int32_t canvas_y)
+{
     const int SW = M5.Display.width(), SH = M5.Display.height();
+    const int visTop = STATUS_H, visBot = SH - FOOTER_H;
 
-    // Repaint only when something has actually changed.
-    //
-    // This used to run unconditionally at frame rate, and while any slot was
-    // incomplete it cleared the whole map area first - so every frame wiped
-    // the screen and re-blitted the finished tiles. At 3.3 MB per tile that
-    // is a lot of traffic to redraw identical pixels, and the ready tiles
-    // visibly flashed against the background on each cycle.
-    //
-    // The signature covers everything that can alter the image: which tiles
-    // are drawable, the grid generation, where the crop sits, and the marker.
-    // The marker moves with the fix, roughly once a second, so this settles
-    // to about 1 Hz instead of 15.
-    //
-    // The coarse fill runs first and unconditionally. It changes slot states,
-    // which is part of the signature - deferring it until after the early-out
-    // would leave pending slots unfilled, the signature unchanged, and the
-    // screen frozen until a render happened to land.
-    coarse_fill_pending();
+    if (rx < 0) { rw += rx; rx = 0; }
+    if (ry < visTop) { rh -= visTop - ry; ry = visTop; }
+    if (rx + rw > SW) rw = SW - rx;
+    if (ry + rh > visBot) rh = visBot - ry;
+    if (rw <= 0 || rh <= 0) return;
 
-    // The canvas is GRID_N * SUBTILE_PX square; the visible window is centred
-    // on the marker so it stays put while the world moves underneath.
-    int32_t cropx = (int32_t)(g_marker_gx) - SW / 2;
-    int32_t cropy = (int32_t)(g_marker_gy) - SH / 2;
-
-    uint32_t sig = 0;
-    xSemaphoreTake(g_glock, portMAX_DELAY);
-    sig = g_grid.generation * 2654435761u;
-    for (int i = 0; i < GRID_COUNT; i++)
-        sig = sig * 31 + (uint32_t)g_grid.slots[i].state;
-    xSemaphoreGive(g_glock);
-    sig = sig * 31 + (uint32_t)cropx;
-    sig = sig * 31 + (uint32_t)cropy;
-    sig = sig * 31 + (uint32_t)(gnss_coarse(fix) ? 1 : 0);
-    sig = sig * 31 + (uint32_t)(fix.speedKmh > 3.0 ? (int)fix.course : -1);
-
-    static uint32_t last_sig = 0;
-    static bool have_last = false;
-    if (have_last && sig == last_sig && !g_force_redraw) return;
-    last_sig = sig;
-    have_last = true;
-    g_force_redraw = false;
-
-    uint64_t t_draw0 = esp_timer_get_time();
-    M5.Display.setClipRect(0, STATUS_H, SW, SH - STATUS_H - FOOTER_H);
-
-    // Tiles normally repaint the whole screen, which is what erases the
-    // previous frame's marker. When some are missing the uncovered area never
-    // gets rewritten, so clear first - but only on a repaint, not per frame.
-    bool covered = true;
+    // Paint background first when any tile is absent, so the gaps behind
+    // them do not keep whatever was there before - which is how the marker
+    // used to smear across the screen.
+    bool any_missing = false;
     xSemaphoreTake(g_glock, portMAX_DELAY);
     for (int i = 0; i < GRID_COUNT; i++)
-        if (!tile_drawable(g_grid.slots[i].state)) { covered = false; break; }
+        if (!tile_drawable(g_grid.slots[i].state)) { any_missing = true; break; }
     xSemaphoreGive(g_glock);
-    if (!covered) M5.Display.fillRect(0, STATUS_H, SW, SH - STATUS_H - FOOTER_H,
-                                      style_background());
-
-    // Push only the part of each tile that is actually on screen.
-    //
-    // pushImage sends the whole buffer and lets the panel clip, so a 1280px
-    // tile with a sliver on screen still costs 3.3 MB. With four resident
-    // tiles that was up to 13 MB per repaint to show 1.5 MB of visible area,
-    // measured at 773 ms - a third of a tile render, and contending for the
-    // same PSRAM the renderer is writing to.
-    //
-    // setAddrWindow plus per-row writePixels sends only the intersection.
-    // The rows are not contiguous in the source once cropped horizontally,
-    // which is why this is a row loop rather than one call.
-    // pushImage handled pixel format for us; writePixels is lower level and
-    // takes the byte order explicitly. If the map comes out with red and blue
-    // exchanged, flip this.
-    #ifndef BLIT_SWAP_BYTES
-    #define BLIT_SWAP_BYTES false
-    #endif
-
-    const int VIS_TOP = STATUS_H, VIS_BOT = SH - FOOTER_H;
+    if (any_missing) M5.Display.fillRect(rx, ry, rw, rh, style_background());
 
     xSemaphoreTake(g_glock, portMAX_DELAY);
     M5.Display.startWrite();
@@ -746,13 +760,14 @@ void map_draw(const GnssFix &fix) {
             int i = r * GRID_N + c;
             if (!tile_drawable(g_grid.slots[i].state)) continue;
 
-            int32_t sx = c * SUBTILE_PX - cropx;
-            int32_t sy = r * SUBTILE_PX - cropy;
+            // Tile's top-left in screen coordinates.
+            int32_t sx = c * SUBTILE_PX - canvas_x;
+            int32_t sy = visTop + r * SUBTILE_PX - canvas_y;
 
-            int32_t dx0 = sx > 0 ? sx : 0;
-            int32_t dy0 = sy > VIS_TOP ? sy : VIS_TOP;
-            int32_t dx1 = sx + SUBTILE_PX < SW ? sx + SUBTILE_PX : SW;
-            int32_t dy1 = sy + SUBTILE_PX < VIS_BOT ? sy + SUBTILE_PX : VIS_BOT;
+            int32_t dx0 = sx > rx ? sx : rx;
+            int32_t dy0 = sy > ry ? sy : ry;
+            int32_t dx1 = sx + SUBTILE_PX < rx + rw ? sx + SUBTILE_PX : rx + rw;
+            int32_t dy1 = sy + SUBTILE_PX < ry + rh ? sy + SUBTILE_PX : ry + rh;
             if (dx0 >= dx1 || dy0 >= dy1) continue;
 
             int32_t w = dx1 - dx0, h = dy1 - dy0;
@@ -767,46 +782,94 @@ void map_draw(const GnssFix &fix) {
     }
     M5.Display.endWrite();
     xSemaphoreGive(g_glock);
+}
 
-    // Position marker, drawn on top rather than into any tile buffer.
-    int mx = SW / 2, my = SH / 2;
-    if (gnss_coarse(fix)) {
-        uint16_t col = gnss_fine(fix) ? M5.Display.color565(30, 90, 220)
-                                      : M5.Display.color565(150, 150, 160);
-        M5.Display.fillCircle(mx, my, 9, col);
-        M5.Display.drawCircle(mx, my, 9, TFT_WHITE);
-        M5.Display.drawCircle(mx, my, 10, TFT_WHITE);
+static void draw_marker(const GnssFix &fix, int mx, int my) {
+    if (!gnss_coarse(fix)) return;
+    uint16_t col = gnss_fine(fix) ? M5.Display.color565(30, 90, 220)
+                                  : M5.Display.color565(150, 150, 160);
+    if (fix.speedKmh > 3.0) {
+        float a = (fix.course - 90.0f) * 0.017453292f;
+        M5.Display.drawLine(mx, my, mx + (int)(26 * cosf(a)),
+                            my + (int)(26 * sinf(a)), col);
+    }
+    M5.Display.fillCircle(mx, my, 9, col);
+    M5.Display.drawCircle(mx, my, 9, TFT_WHITE);
+    M5.Display.drawCircle(mx, my, 10, TFT_WHITE);
+}
 
-        // Heading needle. Course over ground is noise below walking pace, so
-        // it is only drawn once actually moving.
-        if (fix.speedKmh > 3.0f) {
-            float a = (fix.course - 90.0f) * 0.017453292f;
-            M5.Display.drawLine(mx, my,
-                                mx + (int)(26 * cosf(a)),
-                                my + (int)(26 * sinf(a)), col);
-        }
+void map_draw(const GnssFix &fix) {
+    if (!g_visible || !g_view_set) return;
+    const int SW = M5.Display.width(), SH = M5.Display.height();
+    const int visTop = STATUS_H, visBot = SH - FOOTER_H;
+
+    coarse_fill_pending();
+
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    tile_id_t origin = g_grid.origin;
+    uint32_t gen = g_grid.generation;
+    uint32_t states = 0;
+    for (int i = 0; i < GRID_COUNT; i++)
+        states = states * 7 + (uint32_t)g_grid.slots[i].state;
+    xSemaphoreGive(g_glock);
+
+    // View position within the canvas, and the marker's screen position.
+    int32_t canvas_x = (int32_t)((g_view_wx - (double)origin.x) * SUBTILE_PX);
+    int32_t canvas_y = (int32_t)((g_view_wy - (double)origin.y) * SUBTILE_PX);
+    int mx = (int)((g_marker_wx - g_view_wx) * SUBTILE_PX);
+    int my = visTop + (int)((g_marker_wy - g_view_wy) * SUBTILE_PX);
+
+    static int32_t last_cx = INT32_MIN, last_cy = INT32_MIN;
+    static uint32_t last_gen = 0, last_states = 0;
+    static int last_mx = INT32_MIN, last_my = INT32_MIN;
+    static bool have_last = false;
+
+    bool viewMoved  = (canvas_x != last_cx || canvas_y != last_cy);
+    bool tilesMoved = (gen != last_gen || states != last_states);
+    bool markerMoved = (mx != last_mx || my != last_my);
+
+    if (have_last && !viewMoved && !tilesMoved && !markerMoved && !g_force_redraw)
+        return;
+
+    uint64_t t0 = esp_timer_get_time();
+
+    if (!have_last || viewMoved || tilesMoved || g_force_redraw) {
+        // Everything can have changed; repaint the visible area.
+        blit_region(0, visTop, SW, visBot - visTop, canvas_x, canvas_y);
+    } else {
+        // Only the marker moved, which is the common case now that the view
+        // sits still inside the band. Repainting its old and new
+        // neighbourhoods is a few thousand pixels instead of a million.
+        const int R = MARKER_CLEAR_R;
+        blit_region(last_mx - R, last_my - R, R * 2, R * 2, canvas_x, canvas_y);
+        blit_region(mx - R, my - R, R * 2, R * 2, canvas_x, canvas_y);
     }
 
+    M5.Display.setClipRect(0, visTop, SW, visBot - visTop);
+    draw_marker(fix, mx, my);
     M5.Display.clearClipRect();
 
-    // Blit cost, and how much of the wall clock it is taking.
-    //
-    // pushImage is DMA-backed and returned instantly for a 512px tile on an
-    // idle device, but four 1280px tiles is 13 MB read out of PSRAM while the
-    // render worker is writing to it on the other core. Whether that is free
-    // is a question about bus contention, not about the API - so it is
-    // measured rather than assumed.
-    uint32_t ms = (uint32_t)((esp_timer_get_time() - t_draw0) / 1000);
+    last_cx = canvas_x; last_cy = canvas_y;
+    last_gen = gen; last_states = states;
+    last_mx = mx; last_my = my;
+    have_last = true;
+    g_force_redraw = false;
+
+    uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     g_stats.last_draw_ms = ms;
     g_stats.draw_total_ms += ms;
     g_stats.draws++;
     if (ms > g_stats.max_draw_ms) g_stats.max_draw_ms = ms;
 }
 
-// Background fetchers hold the archive lock for a whole tile, so they can
-// stall the renderer. Yielding while the render queue has work keeps the
-// visible map responsive: a tile the user is looking at always beats one
-// being stored for later.
+// ---- background fetchers ---------------------------------------------------
+// These hold the archive lock for a whole tile, so they can stall the
+// renderer. Yielding while the render queue has work keeps the visible map
+// responsive: a tile the user is looking at always beats one being stored
+// for later.
+static volatile int  g_pf_progress = 0;
+static volatile bool g_pf_busy = false;
+
 static void yield_to_renderer() {
     for (int i = 0; i < 200; i++) {                 // ~10 s ceiling
         if (uxQueueMessagesWaiting(g_jobs) == 0) return;
@@ -814,14 +877,12 @@ static void yield_to_renderer() {
     }
 }
 
-// ---- prefetch --------------------------------------------------------------
+// ---- radius prefetch -------------------------------------------------------
 struct PrefetchArgs {
     double lat, lon;
     int radius;
     uint8_t z1, z2;
 };
-static volatile int  g_pf_progress = 0;
-static volatile bool g_pf_busy = false;
 
 static void prefetch_task(void *arg) {
     PrefetchArgs a = *(PrefetchArgs *)arg;
@@ -832,18 +893,18 @@ static void prefetch_task(void *arg) {
     if (!buf) { g_pf_busy = false; vTaskDelete(nullptr); return; }
 
     int side = a.radius * 2 + 1;
-    int levels = (DATA_ZOOM_OF(a.z1) == DATA_ZOOM_OF(a.z2)) ? 1 : 2;
-    int total = side * side * levels;
-    int done = 0, fetched = 0, cached = 0, missing = 0;
-    uint64_t t0 = esp_timer_get_time();
-
     // Fetch at the data zoom: those are the tiles that actually get stored,
     // and asking for display-zoom ids would cache four times as many of the
     // wrong thing.
     const uint8_t zs[2] = { (uint8_t)DATA_ZOOM_OF(a.z1),
                             (uint8_t)DATA_ZOOM_OF(a.z2) };
-    for (int zi = 0; zi < 2; zi++) {
-        if (zi == 1 && zs[1] == zs[0]) break;      // one level only
+    int levels = (zs[0] == zs[1]) ? 1 : 2;
+    int total = side * side * levels;
+
+    int done = 0, fetched = 0, cached = 0, missing = 0;
+    uint64_t t0 = esp_timer_get_time();
+
+    for (int zi = 0; zi < levels; zi++) {
         merc_pt_t p = merc_from_ll(a.lat, a.lon, zs[zi]);
         int32_t cx = (int32_t)p.x, cy = (int32_t)p.y;
 
@@ -888,26 +949,30 @@ bool map_prefetch_start(int radius, uint8_t z_wide, uint8_t z_close) {
     xSemaphoreTake(g_glock, portMAX_DELAY);
     tile_id_t c = g_grid.origin;
     xSemaphoreGive(g_glock);
-    merc_pt_t mid = { (double)c.x + 0.5, (double)c.y + 0.5, c.z };
+    merc_pt_t mid = { (double)c.x + GRID_N / 2.0, (double)c.y + GRID_N / 2.0, c.z };
     merc_to_ll(mid, &a->lat, &a->lon);
 
     a->radius = radius; a->z1 = z_wide; a->z2 = z_close;
     g_pf_busy = true;
     g_pf_progress = 0;
 
-    // Low priority, its own core: it should soak up spare time, never
-    // compete with rendering or the serial drain.
     // 10 KiB: inflate builds its Huffman tables on the stack (~3.5 KiB) on
     // top of this task's own frames.
     if (xTaskCreatePinnedToCore(prefetch_task, "prefetch", 10240, a, 1, nullptr, 1)
         != pdPASS) {
         free(a); g_pf_busy = false; return false;
     }
-    Serial.printf("prefetch: %d x %d tiles at z%u and z%u around %.4f,%.4f\n",
-                  radius * 2 + 1, radius * 2 + 1, z_wide, z_close, a->lat, a->lon);
+    Serial.printf("prefetch: %d x %d tiles at z%u around %.4f,%.4f\n",
+                  radius * 2 + 1, radius * 2 + 1,
+                  (unsigned)DATA_ZOOM_OF(z_close), a->lat, a->lon);
     return true;
 }
 
+// ---- world floor -----------------------------------------------------------
+// z0-6 is only 5461 tiles but covers the entire planet, so there is always
+// something to fall back to when the working level is missing. Checkpointed,
+// because at roughly one tile a second the walk takes hours and will be
+// interrupted.
 static void world_task(void *arg) {
     (void)arg;
     uint8_t *buf = (uint8_t *)ps_malloc(TILE_CAP);
@@ -921,7 +986,6 @@ static void world_task(void *arg) {
     int64_t next_report = started;
     int64_t next_ckpt = started;
 
-    // Resume point, if a previous run was interrupted.
     uint8_t rz = 0; uint32_t rx = 0, ry = 0;
     bool resuming = netsource_world_load_pos(&rz, &rx, &ry);
     if (resuming) {
@@ -934,16 +998,14 @@ static void world_task(void *arg) {
                       (unsigned long)done, (unsigned long)total);
     }
 
-    // Levels are wildly uneven - z0 is one tile, z6 is 4096 - so reporting
-    // per level means nothing for minutes at a time near the end. Report on a
-    // timer instead, with a rate and an estimate, so a stall is visible.
     for (int z = 0; z <= WORLD_FLOOR_ZOOM; z++) {
         uint32_t n = 1u << z;
-        if (resuming && z < rz) continue;          // whole level already done
+        if (resuming && z < rz) continue;
         for (uint32_t x = 0; x < n; x++) {
             if (resuming && z == rz && x < rx) continue;
             for (uint32_t y = 0; y < n; y++) {
                 if (resuming && z == rz && x == rx && y < ry) continue;
+
                 uint32_t len = TILE_CAP;
                 bool from_net = false;
                 if (netsource_get((uint8_t)z, x, y, buf, &len, &from_net)) {
@@ -972,9 +1034,8 @@ static void world_task(void *arg) {
                 // Checkpoint on a timer rather than a tile count: the cost is
                 // one small file write, and 30 s is a bounded amount of work
                 // to redo after a power cut.
-                int64_t tnow = esp_timer_get_time();
-                if (tnow >= next_ckpt) {
-                    next_ckpt = tnow + 30000000;
+                if (now >= next_ckpt) {
+                    next_ckpt = now + 30000000;
                     netsource_world_save_pos((uint8_t)z, x, y);
                 }
 
@@ -993,6 +1054,7 @@ static void world_task(void *arg) {
             }
         }
     }
+
     free(buf);
     netsource_world_mark_done();
     Serial.printf("world: floor stored in %.0f min (%lu fetched, %lu already "
