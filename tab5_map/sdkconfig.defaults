@@ -1,0 +1,23 @@
+# Matches the Arduino board options currently used:
+#   FlashSize=16M PSRAM=enabled PartitionScheme=app3M_fat9M_16MB
+#   CDCOnBoot=cdc USBMode=hwcdc
+CONFIG_IDF_TARGET="esp32p4"
+
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# The sketch keeps its own loop; let Arduino start it as it does today.
+CONFIG_AUTOSTART_ARDUINO=y
+
+# Console over the P4's native USB, matching CDCOnBoot=cdc / USBMode=hwcdc.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# USB host, for mass storage.
+CONFIG_USB_HOST_ENABLED=y
+CONFIG_FATFS_LFN_HEAP=y

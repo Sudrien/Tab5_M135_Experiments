@@ -11,6 +11,7 @@
 #define GNSS_H
 
 #include <stdint.h>
+#include <stddef.h>   // size_t, used by the assistance API below
 
 struct Constellation {
     const char *name;
@@ -47,5 +48,22 @@ void gnss_get(GnssFix *out);
 uint32_t gnss_sentences();
 uint32_t gnss_pps_count();
 uint32_t gnss_pps_interval();
+
+// ---- AssistNow Autonomous --------------------------------------------------
+// Predicted orbits computed by the receiver itself - no server, no token. The
+// predictions live in battery-backed RAM held by the supercap on V_BCKP, which
+// lasts hours rather than the three days the predictions are good for, so they
+// are saved to the card and pushed back at boot.
+
+// Turn on AssistNow Autonomous (and ack-aiding, which terminates a database
+// poll). Call once after gnss_start().
+bool gnss_enable_aop();
+
+// Poll the navigation database out of the receiver into `dst`. Returns bytes
+// written, 0 on failure. The bytes are complete UBX frames.
+size_t gnss_dbd_read(uint8_t *dst, size_t cap_bytes);
+
+// Push a previously saved database back, before the receiver starts searching.
+bool gnss_dbd_write(const uint8_t *src, size_t len);
 
 #endif // GNSS_H

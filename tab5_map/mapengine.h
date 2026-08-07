@@ -30,6 +30,15 @@ extern "C" {
 struct MapStats {
     uint32_t rendered = 0, dropped = 0, notfound = 0, failed = 0;
     uint32_t shifts = 0, queued = 0;
+
+    // How often the coarse overview was actually drawn from, split by what
+    // needed it. The overview costs a render of its own every few tile
+    // crossings, and whether that is worth paying depends entirely on this
+    // ratio - which is not something to guess at once local archives are in
+    // play. coarse_gap counts slots the archive could not fill (the case that
+    // is really about incomplete data); coarse_wait counts slots merely
+    // waiting on the rasteriser.
+    uint32_t coarse_renders = 0, coarse_gap = 0, coarse_wait = 0;
     uint32_t last_render_ms = 0;
     uint32_t queue_depth = 0;
 

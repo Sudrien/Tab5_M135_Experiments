@@ -90,6 +90,97 @@ static void parseSentence(char *s, GnssFix &fix) {
     }
 }
 
+
+// ---- UBX ------------------------------------------------------------------
+// The receiver speaks NMEA outbound, which is all the parser above needs, but
+// assistance is UBX-only. This is the minimum needed for that: frame a message,
+// and recognise one arriving in the middle of the NMEA stream.
+
+static SemaphoreHandle_t g_ubx_lock = nullptr;   // one UBX exchange at a time
+
+// A captured UBX response, filled by the reader task and read by the caller.
+struct UbxCapture {
+    uint8_t  cls, id;          // what to capture; 0xFF matches anything
+    uint8_t *buf;              // whole frames appended here, header to checksum
+    size_t   cap, len;
+    uint32_t frames;
+    uint8_t  ack_cls, ack_id;  // frame that ends the capture
+    volatile bool done;
+    uint32_t last_ms;          // for idle-timeout termination
+};
+static UbxCapture *g_cap = nullptr;
+
+static void ubx_checksum(const uint8_t *b, size_t n, uint8_t *a, uint8_t *k) {
+    uint8_t ca = 0, ck = 0;
+    for (size_t i = 0; i < n; i++) { ca += b[i]; ck += ca; }
+    *a = ca; *k = ck;
+}
+
+// Frame and send. Payload may be null for a poll.
+static void ubx_send(uint8_t cls, uint8_t id, const uint8_t *payload, uint16_t len) {
+    uint8_t hdr[4] = { cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    uint8_t ca = 0, ck = 0;
+    ubx_checksum(hdr, 4, &ca, &ck);
+    // Checksum runs over class, id, length and payload, so it has to be
+    // continued across the two buffers rather than restarted.
+    for (uint16_t i = 0; i < len; i++) { ca += payload[i]; ck += ca; }
+
+    Serial1.write((uint8_t)0xB5); Serial1.write((uint8_t)0x62);
+    Serial1.write(hdr, 4);
+    if (len) Serial1.write(payload, len);
+    Serial1.write(ca); Serial1.write(ck);
+    Serial1.flush();
+}
+
+// Offered every byte the reader sees. Returns true while it is consuming a UBX
+// frame, so the NMEA line assembler leaves those bytes alone.
+static bool ubx_feed(uint8_t c) {
+    static int      st = 0;
+    static uint8_t  cls, id;
+    static uint16_t len, got;
+    static uint8_t  frame[512];
+    static size_t   flen;
+
+    switch (st) {
+        case 0: if (c == 0xB5) { st = 1; return true; } return false;
+        case 1:
+            if (c == 0x62) { st = 2; flen = 0; frame[flen++] = 0xB5; frame[flen++] = 0x62; return true; }
+            st = 0; return false;                    // false start, hand back
+        case 2: cls = c; frame[flen++] = c; st = 3; return true;
+        case 3: id  = c; frame[flen++] = c; st = 4; return true;
+        case 4: len = c; frame[flen++] = c; st = 5; return true;
+        case 5:
+            len |= (uint16_t)c << 8; frame[flen++] = c; got = 0;
+            // A length this large means the stream is not really UBX; drop it
+            // rather than overrun, and let NMEA resynchronise on the next '$'.
+            st = (len > sizeof(frame) - 8) ? 0 : 6;
+            return true;
+        case 6:
+            frame[flen++] = c;
+            if (++got >= len) st = 7;
+            return true;
+        case 7: frame[flen++] = c; st = 8; return true;    // checksum A
+        case 8: {
+            frame[flen++] = c;
+            st = 0;
+            UbxCapture *cap = g_cap;
+            if (!cap || cap->done) return true;
+            if (cls == cap->ack_cls && id == cap->ack_id) { cap->done = true; return true; }
+            if (cap->cls != 0xFF && cls != cap->cls) return true;
+            if (cap->id  != 0xFF && id  != cap->id)  return true;
+            if (cap->len + flen <= cap->cap) {
+                memcpy(cap->buf + cap->len, frame, flen);
+                cap->len += flen;
+                cap->frames++;
+                cap->last_ms = millis();
+            }
+            return true;
+        }
+    }
+    st = 0;
+    return false;
+}
+
 // ---- task ------------------------------------------------------------------
 static void gnss_task(void *arg) {
     (void)arg;
@@ -102,6 +193,10 @@ static void gnss_task(void *arg) {
 
         while (Serial1.available()) {
             char c = Serial1.read();
+            // UBX frames are interleaved with NMEA on the same wire. Offer each
+            // byte to the binary detector first; it claims the ones that belong
+            // to a frame so they never reach the line assembler.
+            if (ubx_feed((uint8_t)c)) continue;
             if (c == '\n') {
                 line[pos] = 0;
                 parseSentence(line, local);
@@ -119,11 +214,145 @@ static void gnss_task(void *arg) {
     }
 }
 
+
+// ---- AssistNow Autonomous --------------------------------------------------
+// The receiver predicts its own satellite orbits from ephemeris it has already
+// observed, good for about three days. No server, no token, no network - it
+// derives the data rather than fetching it.
+//
+// The catch is where the result lives: battery-backed RAM, held by the 0.22 F
+// supercap on V_BCKP, which lasts something like three to five hours at the
+// module's backup current. A three-day prediction on five hours of storage is
+// mostly thrown away overnight. So the database is polled out to the host and
+// written to the card, then pushed back at the next boot - which is what makes
+// the prediction outlive the supercap.
+//
+// UBX-CFG-NAVX5 exists in three versions of different lengths, so this reads
+// the current one and edits it rather than constructing a message, which is
+// also how the u-blox reference drivers do it.
+
+#define UBX_CLS_CFG   0x06
+#define UBX_ID_NAVX5  0x23
+#define UBX_CLS_MGA   0x13
+#define UBX_ID_DBD    0x80
+#define UBX_ID_MGA_ACK 0x60
+#define UBX_CLS_ACK   0x05
+
+// Run one UBX exchange: send, then collect matching frames until the
+// terminating frame arrives or things go quiet.
+static bool ubx_exchange(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len,
+                         UbxCapture *cap, uint32_t timeout_ms, uint32_t idle_ms)
+{
+    if (!g_ubx_lock) return false;
+    if (xSemaphoreTake(g_ubx_lock, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+
+    cap->len = 0; cap->frames = 0; cap->done = false; cap->last_ms = millis();
+    g_cap = cap;
+
+    ubx_send(cls, id, pl, len);
+
+    uint32_t t0 = millis();
+    while (!cap->done && millis() - t0 < timeout_ms) {
+        // Idle termination as well as the ack, so a receiver with ackAiding
+        // off still finishes instead of always burning the full timeout.
+        if (cap->frames && idle_ms && millis() - cap->last_ms > idle_ms) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    g_cap = nullptr;
+    xSemaphoreGive(g_ubx_lock);
+    return cap->frames > 0 || cap->done;
+}
+
+// Enable AssistNow Autonomous, and ack-aiding along with it - the latter is
+// what terminates a database poll, and it lives in the same message.
+bool gnss_enable_aop() {
+    static uint8_t buf[128];
+    UbxCapture cap = { UBX_CLS_CFG, UBX_ID_NAVX5, buf, sizeof buf, 0, 0,
+                       0xFF, 0xFF, false, 0 };
+
+    if (!ubx_exchange(UBX_CLS_CFG, UBX_ID_NAVX5, nullptr, 0, &cap, 1500, 250)) {
+        Serial.println("gnss: CFG-NAVX5 poll got no reply");
+        return false;
+    }
+    // frame is B5 62 cls id lenL lenH <payload> ckA ckB
+    if (cap.len < 6 + 32 + 2) {
+        Serial.printf("gnss: CFG-NAVX5 reply too short (%u B)\n", (unsigned)cap.len);
+        return false;
+    }
+    uint16_t plen = (uint16_t)buf[4] | ((uint16_t)buf[5] << 8);
+    uint8_t *p = buf + 6;
+
+    // aopCfg is byte 27 and aopOrbMaxErr bytes 30-31 in every version, and
+    // ackAiding is byte 17.
+    //
+    // mask1 selects which of those the receiver actually applies, so writing a
+    // byte without setting its mask bit changes nothing. That is not
+    // hypothetical: this first shipped with mask1 = 0x4000 (aop alone), and
+    // ackAiding was written and silently ignored - the database poll then had
+    // to fall back on its idle timeout because the terminating MGA-ACK never
+    // came. Both bits, or only one of the two settings takes.
+    //
+    //   bit 10 (0x0400) ackAid
+    //   bit 14 (0x4000) aop
+    p[2]  = 0x00;
+    p[3]  = 0x44;            // aop + ackAid; nothing else disturbed
+    p[4]  = 0x00;
+    p[5]  = 0x00;
+    p[17] = 1;               // ackAiding
+    p[27] = 1;               // aopCfg: AssistNow Autonomous on
+    p[30] = 0; p[31] = 0;    // aopOrbMaxErr 0 = leave at the firmware default
+
+    ubx_send(UBX_CLS_CFG, UBX_ID_NAVX5, p, plen);
+    Serial.printf("gnss: AssistNow Autonomous enabled (NAVX5 v%u, %u B)\n",
+                  (unsigned)p[0], (unsigned)plen);
+    return true;
+}
+
+// Poll the navigation database out of the receiver. Returns bytes captured.
+size_t gnss_dbd_read(uint8_t *dst, size_t cap_bytes) {
+    UbxCapture cap = { UBX_CLS_MGA, UBX_ID_DBD, dst, cap_bytes, 0, 0,
+                       UBX_CLS_MGA, UBX_ID_MGA_ACK, false, 0 };
+    if (!ubx_exchange(UBX_CLS_MGA, UBX_ID_DBD, nullptr, 0, &cap, 8000, 500))
+        return 0;
+    Serial.printf("gnss: navigation database %u frames, %u bytes%s\n",
+                  (unsigned)cap.frames, (unsigned)cap.len,
+                  cap.done ? "" : " (idle timeout, no MGA-ACK)");
+    return cap.len;
+}
+
+// Push a previously saved database back. The stored bytes are already complete
+// UBX frames, so they go out verbatim - spaced out, because the receiver drops
+// assistance messages it is too busy to take.
+bool gnss_dbd_write(const uint8_t *src, size_t len) {
+    if (!src || len < 8) return false;
+    if (!g_ubx_lock) return false;
+    if (xSemaphoreTake(g_ubx_lock, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+
+    size_t off = 0; uint32_t sent = 0;
+    while (off + 8 <= len) {
+        if (src[off] != 0xB5 || src[off + 1] != 0x62) break;   // not a frame
+        uint16_t plen = (uint16_t)src[off + 4] | ((uint16_t)src[off + 5] << 8);
+        size_t flen = 6 + plen + 2;
+        if (off + flen > len) break;                            // truncated
+        Serial1.write(src + off, flen);
+        Serial1.flush();
+        off += flen; sent++;
+        vTaskDelay(pdMS_TO_TICKS(7));   // u-blox reference spacing
+    }
+    xSemaphoreGive(g_ubx_lock);
+    Serial.printf("gnss: restored %lu database frames (%u of %u bytes)\n",
+                  (unsigned long)sent, (unsigned)off, (unsigned)len);
+    return sent > 0;
+}
+
 bool gnss_start(int rx_pin, int tx_pin, uint32_t baud, int pps_pin,
                 int core, int priority)
 {
     g_lock = xSemaphoreCreateMutex();
     if (!g_lock) return false;
+    g_ubx_lock = xSemaphoreCreateMutex();
+    if (!g_ubx_lock) return false;
 
     // Must precede begin() - ignored once the port is open. The default 256 B
     // FIFO overflows during a long draw at 38400 baud.

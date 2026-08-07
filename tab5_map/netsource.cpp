@@ -2,8 +2,7 @@
 
 #include "netsource.h"
 #include <Arduino.h>
-#include <SD.h>
-#include <SD_MMC.h>
+#include "storage.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <esp_heap_caps.h>
@@ -64,8 +63,54 @@ static const uint32_t CACHE_MAX_ENTRIES = CACHE_MAX_ENTRIES_CFG;
 static const int MAX_PROBE_DAYS = 8;
 
 static fs::FS *g_fs = nullptr;
-static pmt_t   g_local;                 // world.pmtiles, offline floor
-static bool    g_local_ok = false;
+// ---- local archives --------------------------------------------------------
+// A set rather than a single file, because FAT32 caps one file at 4 GiB and
+// the archive this needs is larger than that.
+//
+// Merging extracts into one world.pmtiles runs straight back into the same
+// wall - one file is one file. Splitting is the way out: a PMTiles header
+// carries min_zoom, max_zoom and a bounding box, so each archive already
+// describes what it holds. Open several, ask each whether it covers the tile
+// being requested, and the 4 GiB limit applies per archive instead of to the
+// whole map.
+//
+// That also makes the split match how the tiles are used. Only z0-6, z11 and
+// z14 are ever requested, and a contiguous extract would spend most of its
+// size on levels nothing asks for. Three files, one per band, keeps each well
+// clear of the limit and skips the rest entirely.
+#ifndef LOCAL_ARCHIVE_MAX
+#define LOCAL_ARCHIVE_MAX 6
+#endif
+
+typedef struct {
+    pmt_t    pmt;
+    File     file;
+    char     path[40];
+    bool     ok;
+} local_src_t;
+
+static local_src_t g_locals[LOCAL_ARCHIVE_MAX];
+static int         g_local_n = 0;
+static int         g_dir_owner = -1;   // which archive last used the shared dir_buf
+
+// Does this archive claim the tile? Zoom is authoritative; the bbox is a
+// cheap reject that avoids a directory walk for a tile the file cannot hold.
+// A miss here is not an error - the caller simply tries the next archive.
+static bool local_covers(const local_src_t *s, uint8_t z, uint32_t x, uint32_t y) {
+    if (!s->ok) return false;
+    if (z < s->pmt.hdr.min_zoom || z > s->pmt.hdr.max_zoom) return false;
+
+    // Tile bounds in e7 degrees, compared against the archive's own bbox.
+    // Only longitude is checked directly; latitude needs the inverse Mercator
+    // and the zoom test has already done most of the work, so the extra
+    // precision is not worth the transcendentals here.
+    uint32_t n = 1u << z;
+    int64_t lon0 = (int64_t)(-1800000000LL) + (int64_t)3600000000LL * x / n;
+    int64_t lon1 = (int64_t)(-1800000000LL) + (int64_t)3600000000LL * (x + 1) / n;
+    if (lon1 < s->pmt.hdr.min_lon_e7 || lon0 > s->pmt.hdr.max_lon_e7) return false;
+    (void)y;
+    return true;
+}
 static pmt_t   g_remote;                // current build, over HTTP
 static bool    g_remote_ok = false;
 
@@ -116,7 +161,7 @@ static NetStats g_stats;
 static SemaphoreHandle_t g_lock = nullptr;
 
 // Scratch owned by this module; only the render worker calls in here.
-static uint8_t *l_dir = nullptr, *l_raw = nullptr, *l_root = nullptr;
+static uint8_t *l_dir = nullptr, *l_raw = nullptr;   // shared local scratch
 static uint8_t *r_dir = nullptr, *r_raw = nullptr, *r_root = nullptr;
 static uint32_t l_cap = 0, r_cap = 0;
 
@@ -133,6 +178,13 @@ static const uint32_t DIR_CAP_MAX = 4 * 1024 * 1024;
 // Larger multipliers cost real PSRAM here: this scratch is allocated twice,
 // once for the local archive and once for the remote.
 static const uint32_t DIR_EXPAND = 4;
+
+// Root-directory cache per local archive. Held for every open archive at once,
+// so it is sized for what a regional extract actually needs rather than for the
+// planet - the remote planet's root is about 15 KB. pmt_open reports a larger
+// requirement through need_raw if one ever turns up, which is visible in the
+// log rather than silent.
+static const uint32_t LOCAL_ROOT_CAP = 64 * 1024;
 
 // Grow a reader's scratch to suit the archive it just opened. Returns false
 // only if the allocation fails outright.
@@ -459,11 +511,14 @@ static int net_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
 }
 
 // ---- SD-backed pmtiles read ------------------------------------------------
-static File g_localFile;
+
+// Reads come from whichever archive asked, passed through io_ctx - there is no
+// longer a single local file to reach for.
 static int sd_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
-    (void)ctx;
-    if (!g_localFile.seek((uint32_t)off)) return -1;
-    return g_localFile.read(dst, len) == (int)len ? 0 : -1;
+    local_src_t *src = (local_src_t *)ctx;
+    if (!src || !src->file) return -1;
+    if (!src->file.seek((uint32_t)off)) return -1;
+    return src->file.read(dst, len) == (int)len ? 0 : -1;
 }
 
 static int gz_inflate(void *ctx, uint8_t codec, const uint8_t *src,
@@ -620,36 +675,99 @@ bool netsource_prefetch_world(uint8_t maxz, uint8_t *buf, uint32_t cap,
 
 // ---- public ----------------------------------------------------------------
 bool netsource_begin(const char *local_path) {
-    g_fs = (SD_MMC.cardType() != CARD_NONE) ? (fs::FS *)&SD_MMC : (fs::FS *)&SD;
+    g_fs = storage_fs();
     g_lock = xSemaphoreCreateMutex();
 
     l_raw  = (uint8_t *)ps_malloc(DIR_CAP_MIN);
     l_dir  = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
-    l_root = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
     r_raw  = (uint8_t *)ps_malloc(DIR_CAP_MIN);
     r_dir  = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
     r_root = (uint8_t *)ps_malloc(DIR_CAP_MIN * DIR_EXPAND);
-    if (!l_dir || !l_raw || !l_root || !r_dir || !r_raw || !r_root) return false;
+    if (!l_dir || !l_raw || !r_dir || !r_raw || !r_root) return false;
     l_cap = r_cap = DIR_CAP_MIN;
 
-    // Local floor.
-    g_localFile = g_fs->open(local_path, FILE_READ);
-    if (g_localFile) {
-        memset(&g_local, 0, sizeof g_local);
-        g_local.read = sd_read; g_local.inflate = gz_inflate;
-        g_local.dir_buf = l_dir; g_local.dir_cap = DIR_CAP_MIN * DIR_EXPAND;
-        g_local.raw_buf = l_raw; g_local.raw_cap = DIR_CAP_MIN;
-        g_local.root_cache = l_root; g_local.root_cache_cap = DIR_CAP_MIN * DIR_EXPAND;
-        g_local_ok = (pmt_open(&g_local) == PMT_OK);
-        if (g_local_ok)
-            g_local_ok = fit_buffers(&g_local, &l_raw, &l_dir, &l_root, &l_cap,
-                                     "local", (uint32_t)g_local.hdr.root_len);
-        Serial.printf("netsource: local %s z%u..%u %s\n", local_path,
-                      g_local.hdr.min_zoom, g_local.hdr.max_zoom,
-                      g_local_ok ? "ok" : "FAILED");
-    } else {
-        Serial.printf("netsource: %s not present\n", local_path);
+    // Local archives.
+    //
+    // The configured path is tried first, then a small set of conventional
+    // names. Each is opened independently and keeps its own root-directory
+    // cache; the large scratch buffers are shared, because lookups are
+    // serialised under g_lock and only one archive is ever mid-walk.
+    static const char *kLocalPaths[] = {
+        nullptr,                 // filled in with local_path below
+        "/floor.pmtiles",        // z0-6, global, keeps the map drawing anywhere
+        "/over.pmtiles",         // the overview level (z12 at COARSE_STEP 2)
+        "/work.pmtiles",         // working zoom, the big one
+        "/local.pmtiles",        // spare, for a second region
+        "/extra.pmtiles",
+    };
+
+    for (size_t pi = 0; pi < sizeof kLocalPaths / sizeof kLocalPaths[0]; pi++) {
+        if (g_local_n >= LOCAL_ARCHIVE_MAX) break;
+        const char *path = pi == 0 ? local_path : kLocalPaths[pi];
+        if (!path || !*path) continue;
+        if (!g_fs->exists(path)) continue;
+
+        local_src_t *src = &g_locals[g_local_n];
+        memset(&src->pmt, 0, sizeof src->pmt);
+        src->ok = false;
+        snprintf(src->path, sizeof src->path, "%s", path);
+
+        src->file = g_fs->open(path, FILE_READ);
+        if (!src->file) continue;
+
+        // Per-archive root cache; shared scratch for everything else.
+        uint8_t *root = (uint8_t *)ps_malloc(LOCAL_ROOT_CAP);
+        if (!root) { src->file.close(); continue; }
+
+        src->pmt.read = sd_read;
+        src->pmt.io_ctx = src;
+        src->pmt.inflate = gz_inflate;
+        src->pmt.dir_buf = l_dir;  src->pmt.dir_cap = DIR_CAP_MIN * DIR_EXPAND;
+        src->pmt.raw_buf = l_raw;  src->pmt.raw_cap = DIR_CAP_MIN;
+        src->pmt.root_cache = root; src->pmt.root_cache_cap = LOCAL_ROOT_CAP;
+
+        src->ok = (pmt_open(&src->pmt) == PMT_OK);
+        if (!src->ok) {
+            Serial.printf("netsource: local %s FAILED to open\n", path);
+            free(root);
+            src->file.close();
+            continue;
+        }
+
+        // Does the file actually contain what its header claims?
+        //
+        // A multi-GB archive copied to a card is realistically going to fail by
+        // being truncated - a full card, a yanked reader, a copy that reported
+        // success it had not earned. The header still parses perfectly in that
+        // case, so the archive opens, and the damage only shows up later as
+        // tiles that mysteriously fail to inflate somewhere out on a drive.
+        //
+        // The header says where the data ends, so comparing that against the
+        // file size catches it at boot for free - no hashing, no reading the
+        // body. It cannot detect corruption *within* the file; for that, hash
+        // the file on the machine that wrote it (see below).
+        uint64_t need = src->pmt.hdr.data_off + src->pmt.hdr.data_len;
+        uint64_t have = (uint64_t)src->file.size();
+        if (have < need) {
+            Serial.printf("netsource: local %s TRUNCATED - header needs %llu B, "
+                          "file is %llu B (%.1f%%). Ignoring it.\n",
+                          path, (unsigned long long)need,
+                          (unsigned long long)have, 100.0 * have / (double)need);
+            src->ok = false;
+            free(root);
+            src->file.close();
+            continue;
+        }
+
+        Serial.printf("netsource: local %s z%u..%u  lon %.2f..%.2f  ok\n",
+                      path, src->pmt.hdr.min_zoom, src->pmt.hdr.max_zoom,
+                      src->pmt.hdr.min_lon_e7 / 1e7, src->pmt.hdr.max_lon_e7 / 1e7);
+        g_local_n++;
     }
+
+    if (g_local_n == 0)
+        Serial.printf("netsource: no local archives (looked for %s and "
+                      "/floor,/over,/work,/local,/extra .pmtiles)\n", local_path);
 
     manifest_load();
     if (g_build[0]) {
@@ -906,10 +1024,25 @@ static bool netsource_get_locked(uint8_t z, uint32_t x, uint32_t y,
         g_stats.online = false;
     }
 
-    // 3. local floor
-    if (g_local_ok) {
+    // 3. local archives
+    for (int i = 0; i < g_local_n; i++) {
+        local_src_t *src = &g_locals[i];
+        if (!local_covers(src, z, x, y)) continue;
+
+        // The archives share one dir_buf, and pmtiles.c reuses whatever that
+        // buffer already holds to avoid re-reading a leaf directory. That
+        // shortcut is keyed on an offset and length, which are only meaningful
+        // within one archive - so switching archives must retire the previous
+        // owner's claim, or the next lookup could match an offset from a
+        // different file and read another archive's directory as its own.
+        if (i != g_dir_owner) {
+            if (g_dir_owner >= 0 && g_dir_owner < g_local_n)
+                g_locals[g_dir_owner].pmt.dir_len = 0;
+            g_dir_owner = i;
+        }
+
         uint32_t n = cap;
-        if (pmt_get(&g_local, z, x, y, dst, &n) == PMT_OK) {
+        if (pmt_get(&src->pmt, z, x, y, dst, &n) == PMT_OK) {
             *len = n;
             g_stats.local_hits++;
             return true;

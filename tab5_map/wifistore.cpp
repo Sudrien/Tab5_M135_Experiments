@@ -2,8 +2,7 @@
 
 #include "wifistore.h"
 #include <Arduino.h>
-#include <SD.h>
-#include <SD_MMC.h>
+#include "storage.h"
 #include <esp_system.h>
 #include <esp_mac.h>
 #include <esp_efuse.h>
@@ -24,12 +23,8 @@ static const uint8_t VERSION  = 1;
 // caught rather than producing a plausible-looking credential.
 
 static fs::FS *fsptr() {
-    // Whichever bus the card came up on. map_begin already mounted it.
-    static fs::FS *cached = nullptr;
-    if (cached) return cached;
-    if (SD_MMC.cardType() != CARD_NONE) { cached = &SD_MMC; return cached; }
-    cached = &SD;
-    return cached;
+    // Whichever store the boot sequence mounted. map_begin got there first.
+    return storage_fs();
 }
 
 // ---- device-bound keys -----------------------------------------------------

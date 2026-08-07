@@ -3,8 +3,7 @@
 #include "tilecache.h"
 #include "mapconfig.h"
 #include <Arduino.h>
-#include <SD.h>
-#include <SD_MMC.h>
+#include "storage.h"
 #include <string.h>
 #include <stdlib.h>
 #include <freertos/FreeRTOS.h>
@@ -204,7 +203,7 @@ bool tilecache_open(const char *build, uint32_t max_entries) {
     if (g_blob && g_idx && build && strcmp(build, g_build) == 0) return true;
 
     if (!g_clock) g_clock = xSemaphoreCreateMutex();
-    g_fs = (SD_MMC.cardType() != CARD_NONE) ? (fs::FS *)&SD_MMC : (fs::FS *)&SD;
+    g_fs = storage_fs();
     tilecache_close();
 
     snprintf(g_build, sizeof g_build, "%s", build ? build : "");

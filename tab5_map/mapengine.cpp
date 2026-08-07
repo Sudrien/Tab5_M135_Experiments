@@ -84,16 +84,29 @@ static uint16_t  *w_cov = nullptr;
 // ground than the screen. New slots are filled by upscaling from it, so the
 // map is never blank - only soft until the real tile lands.
 //
-// COARSE_STEP 3 means one coarse tile spans 8x8 working tiles, which the 3x3
-// grid stays inside for a long time before it needs re-rendering. Rendering
-// it at 1024 rather than 512 halves the upscale factor, and coarse zooms
-// carry far less geometry so it costs less than a working tile despite the
-// larger surface.
-// COARSE_STEP 3 spans 8x8 working tiles. With SUBTILE_PX at 1024 that means
-// upscaling 128 source pixels to 1024, which is very soft - acceptable for a
-// placeholder that lives under a second, and the alternative is re-rendering
-// the overview far more often.
-static const int COARSE_STEP = 3;
+// COARSE_STEP sets how far below the working zoom that tile is drawn, and with
+// it both the softness and how often it has to be re-rendered:
+//
+//   step  overview  span  src px/tile  upscale to SUBTILE_PX 1280
+//     3      z11     8x8       64          20.0x
+//     2      z12     4x4      128          10.0x   <- current
+//
+// (src px/tile is COARSE_PX / span, so COARSE_PX is the other lever: doubling
+// it to 1024 halves the upscale again, at 2 MB of PSRAM instead of 0.5 MB.)
+//
+// This was 3, and the placeholder was 64 source pixels stretched to 1280 -
+// blocky enough to be distracting rather than merely soft. The comment here
+// used to describe 128 -> 1024, which was never what mapconfig.h set.
+//
+// The cost of step 2 is re-rendering: one coarse tile now covers 4x4 working
+// tiles instead of 8x8, so the grid leaves it four times as often. A z12 tile
+// carries less geometry than a z11 one covering the same ground, which offsets
+// part of that but not all of it - expect roughly twice the overview render
+// work overall.
+#ifndef COARSE_STEP_CFG
+#define COARSE_STEP_CFG 2
+#endif
+static const int COARSE_STEP = COARSE_STEP_CFG;
 static const uint8_t COARSE_SLOT = 0xFE;   // sentinel job slot
 
 static uint16_t *g_coarse_px = nullptr;
@@ -287,6 +300,7 @@ static void worker_task(void *arg) {
             g_coarse_ok = false;
             tile_state_t res = render_tile(job.id, g_coarse_px, COARSE_PX, 0);
             if (res == TILE_READY) { g_coarse_id = job.id; g_coarse_ok = true; }
+            g_stats.coarse_renders++;
             Serial.printf("map: overview z%u %s in %lu ms\n", job.id.z,
                           res == TILE_READY ? "rendered" : "FAILED",
                           (unsigned long)((esp_timer_get_time() - t0) / 1000));
@@ -402,6 +416,31 @@ static bool coarse_fill(subtile_t *s) {
 // while this is using it. The lock is taken only around the state fields.
 static const int COARSE_FILLS_PER_PASS = 2;
 
+// The overview serves two jobs that are worth separating, because only one of
+// them is about missing data.
+//
+//   NODATA / ERROR - the archive has no tile here, or it failed. Permanent:
+//                    without the fill these slots stay blank forever, which is
+//                    what turns driving past the edge of the extract into a
+//                    white screen. This is the "we don't have comprehensive
+//                    world files" case and is always on.
+//
+//   PENDING        - the tile exists and is being rendered. Temporary, and
+//                    nothing to do with data availability: a local archive
+//                    removes the fetch but not the rasteriser, and a render
+//                    measures ~1400 ms. A band step turns over about two of
+//                    the four slots, so switching this off means roughly
+//                    2.8 s of background per step instead of a soft tile.
+//
+// Set COARSE_FILL_PENDING to 0 to keep only the missing-data insurance. Worth
+// trying once local archives cover the area, where NODATA becomes rare and the
+// question is purely whether a blocky placeholder beats a blank one for the
+// second or two before the real tile lands - which is a matter of taste rather
+// than correctness.
+#ifndef COARSE_FILL_PENDING
+#define COARSE_FILL_PENDING 1
+#endif
+
 static void coarse_fill_pending() {
     // Retry a failed overview on a timer.
     if (!g_coarse_ok && g_coarse_retry_at &&
@@ -429,7 +468,10 @@ static void coarse_fill_pending() {
             // archive could not supply stays blank forever otherwise, which
             // is what turns driving out of cached territory into a white
             // screen rather than a coarse one.
-            if (st == TILE_PENDING || st == TILE_NODATA || st == TILE_ERROR) {
+            bool gap  = (st == TILE_NODATA || st == TILE_ERROR);
+            bool wants = gap || (COARSE_FILL_PENDING && st == TILE_PENDING);
+            if (wants) {
+                if (gap) g_stats.coarse_gap++; else g_stats.coarse_wait++;
                 target = &g_grid.slots[i];
                 snapshot = *target;
                 was = st;
@@ -460,8 +502,8 @@ static void coarse_fill_pending() {
 }
 
 // Queue an overview render if the grid has moved outside what the current
-// overview covers. One coarse tile spans 8x8 working tiles, so this fires
-// rarely - roughly once per eight tile crossings.
+// overview covers. At COARSE_STEP 2 one coarse tile spans 4x4 working tiles,
+// so this fires roughly once per four tile crossings.
 // Force the overview to be re-rendered even though its tile id has not
 // changed - used when the palette changes, where the id is right but the
 // pixels are the wrong colour.
@@ -652,15 +694,32 @@ static void view_follow() {
         return;
     }
 
+    // Leaving the band moves the view one whole band width, so the marker
+    // lands on the opposite third rather than on the line it just crossed.
+    //
+    // Clamping to loX/hiX instead - which is what this did - pins the marker
+    // to the band edge and then drags the view by exactly its movement on
+    // every subsequent fix. Walking a marker steadily across the map, that is
+    // a view move on essentially every fix (1983 out of 2000 in simulation)
+    // against 56 for a discrete step. Both cover the same ground; one does it
+    // in ~12 px dribbles and the other in 422 px steps.
+    //
+    // The cost is not cosmetic. A view move means a repaint, and a full-region
+    // blit has been measured at 100-220 ms - so the clamp spends most of every
+    // GPS second redrawing the screen to shift it by a few pixels.
+    //
+    // Stepping across also puts a third of a screen of new map ahead of the
+    // direction of travel, and leaves the marker a third from either line so
+    // it takes real movement rather than noise to trigger the next step.
     double loX = g_marker_wx - bxHi / SUBTILE_PX;
     double hiX = g_marker_wx - bxLo / SUBTILE_PX;
-    if (g_view_wx < loX) g_view_wx = loX;
-    if (g_view_wx > hiX) g_view_wx = hiX;
+    if (g_view_wx < loX) g_view_wx = hiX;     // crossed the far line, step over
+    if (g_view_wx > hiX) g_view_wx = loX;
 
     double loY = g_marker_wy - byHi / SUBTILE_PX;
     double hiY = g_marker_wy - byLo / SUBTILE_PX;
-    if (g_view_wy < loY) g_view_wy = loY;
-    if (g_view_wy > hiY) g_view_wy = hiY;
+    if (g_view_wy < loY) g_view_wy = hiY;
+    if (g_view_wy > hiY) g_view_wy = loY;
 
     // The canvas is finite, so the view cannot wander past its edges however
     // the band would like it to. This takes priority - showing background is

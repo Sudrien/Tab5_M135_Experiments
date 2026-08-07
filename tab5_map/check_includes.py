@@ -28,8 +28,18 @@ NEEDS = {
     r'\bDNSServer\b':             'DNSServer.h',
 }
 
+# Running this bare used to check nothing at all and exit 0 - a green light
+# that meant "no files were examined". Default to the whole directory so that
+# cannot happen again.
+files = sys.argv[1:]
+if not files:
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = sorted(os.path.join(here, n) for n in os.listdir(here)
+                   if n.endswith(('.c', '.cpp', '.h', '.ino')))
+    print(f'no files given; checking all {len(files)} sources in {here}\n')
+
 bad = 0
-for f in sys.argv[1:]:
+for f in files:
     src = open(f).read()
     body = re.sub(r'//.*', '', src)
     body = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
