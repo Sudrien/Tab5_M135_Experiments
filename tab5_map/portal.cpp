@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <esp_wifi.h>
+#include <esp_task_wdt.h>
 #include <ctype.h>
 
 // Set to 1 to echo submitted passwords to the serial console in full.
@@ -342,6 +343,9 @@ bool portal_run(uint32_t timeout_ms) {
     uint32_t touchStart = 0;
 
     while (!g_done && millis() - t0 < timeout_ms) {
+        // This loop owns the UI task for minutes by design, which is longer
+        // than the watchdog allows - so it has to check in.
+        esp_task_wdt_reset();
         dns.processNextRequest();
         web.handleClient();
         M5.update();

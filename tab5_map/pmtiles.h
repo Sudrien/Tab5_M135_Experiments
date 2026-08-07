@@ -106,6 +106,20 @@ typedef struct {
     uint32_t  root_cache_cap;
     uint32_t  root_cache_len;  // 0 = not yet populated
 
+    // Identity of whatever dir_buf currently holds, so a directory that is
+    // already decompressed in there is not fetched and inflated again.
+    //
+    // This costs nothing: dir_buf has to hold a directory anyway, and after
+    // the first lookup the root is served from root_cache without touching
+    // it, so what survives in dir_buf is the last *leaf*. On a planet archive
+    // a leaf covers a contiguous run of tiles, so consecutive lookups hit it
+    // - which matters enormously when a leaf is 129 KB over the network.
+    //
+    // dir_len == 0 means "holds nothing trustworthy".
+    uint64_t  dir_off;         // source offset the contents came from
+    uint32_t  dir_srclen;      // source (compressed) length
+    uint32_t  dir_len;         // decompressed length held, 0 = empty
+
     // Set whenever a call returns PMT_ENOMEM: the number of bytes that would
     // have been required. Leaf directory sizes are not described anywhere in
     // the header, so without this the caller has no way to size raw_buf
@@ -127,8 +141,17 @@ pmt_err_t pmt_find(pmt_t *p, uint8_t z, uint32_t x, uint32_t y,
 
 // Convenience: look up and read the payload into `dst`. *dst_len starts as
 // capacity, ends as the byte count. Still compressed.
+//
+// Note this repeats the pmt_find walk internally. A caller that has already
+// called pmt_find should use pmt_read_blob instead - over a network reader,
+// re-walking costs a second fetch of the leaf directory.
 pmt_err_t pmt_get(pmt_t *p, uint8_t z, uint32_t x, uint32_t y,
                   uint8_t *dst, uint32_t *dst_len);
+
+// Read a payload whose location is already known, as returned by pmt_find.
+// *dst_len starts as capacity, ends as the byte count.
+pmt_err_t pmt_read_blob(pmt_t *p, uint64_t off, uint32_t len,
+                        uint8_t *dst, uint32_t *dst_len);
 
 // Hilbert tile id, exposed for tests and for cache keys.
 uint64_t  pmt_zxy_to_tileid(uint8_t z, uint32_t x, uint32_t y);

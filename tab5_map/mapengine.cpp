@@ -142,12 +142,15 @@ static tile_state_t render_tile(tile_id_t id, uint16_t *px, int size, int split)
         return TILE_NODATA;
     if (got == 0) return TILE_NODATA;
 
-    // Fingerprint the payload as soon as it lands, and again just before it
-    // is used. A mismatch means something wrote into this buffer in between,
-    // which narrows the search from "somewhere in the fetch path" to
-    // "something else holds this pointer".
+    // The fetch/inflate fingerprint that used to sit here has been removed.
+    // It hashed the whole compressed payload twice on every single render -
+    // two scattered passes over as much as 192 KB of PSRAM per tile - to
+    // catch a clobber that the buffer-growth path between them can no longer
+    // cause. Define MAP_CHECK_TILE_BUFFER to bring it back while chasing one.
+#ifdef MAP_CHECK_TILE_BUFFER
     uint32_t sum_after_fetch = 0;
     for (uint32_t i = 0; i < got; i++) sum_after_fetch = sum_after_fetch * 31 + w_tile[i];
+#endif
 
     // Sanity-check the payload before trusting it. A tile that is not gzip at
     // all means the fetch returned something other than this tile - a
@@ -189,6 +192,7 @@ static tile_state_t render_tile(tile_id_t id, uint16_t *px, int size, int split)
                       (unsigned)(ESP.getFreePsram() / 1024));
     }
 
+#ifdef MAP_CHECK_TILE_BUFFER
     uint32_t sum_before_inflate = 0;
     for (uint32_t i = 0; i < got; i++) sum_before_inflate = sum_before_inflate * 31 + w_tile[i];
     if (sum_before_inflate != sum_after_fetch) {
@@ -197,6 +201,7 @@ static tile_state_t render_tile(tile_id_t id, uint16_t *px, int size, int split)
                       (unsigned long)sum_after_fetch,
                       (unsigned long)sum_before_inflate, dz, dx, dy);
     }
+#endif
 
     uint32_t mlen = MVT_CAP;
     // Tile payloads skip the CRC: corruption here shows up as visibly wrong
@@ -457,6 +462,13 @@ static void coarse_fill_pending() {
 // Queue an overview render if the grid has moved outside what the current
 // overview covers. One coarse tile spans 8x8 working tiles, so this fires
 // rarely - roughly once per eight tile crossings.
+// Force the overview to be re-rendered even though its tile id has not
+// changed - used when the palette changes, where the id is right but the
+// pixels are the wrong colour.
+static void invalidate_coarse() {
+    g_coarse_id = (tile_id_t){ 0, 0, 0 };
+}
+
 static void ensure_coarse(tile_id_t origin) {
     int cz = (int)origin.z - COARSE_STEP;
     if (cz < 0) cz = 0;
@@ -481,16 +493,78 @@ static void ensure_coarse(tile_id_t origin) {
 }
 
 // ---- setup -----------------------------------------------------------------
+// Scratch placement.
+//
+// Internal SRAM is faster than PSRAM for the scattered, non-streaming access
+// the rasteriser does - but it is also the only memory mbedTLS and the AES
+// DMA engine can use, and http_range opens a fresh TLS connection per tile,
+// so a handshake is the peak internal-heap moment in the whole program.
+// Taking 47 KB here starved it: AES could not allocate a DMA descriptor and
+// every remote fetch failed.
+//
+// So only the buffer that actually earns it goes internal. w_cov is read and
+// written several times per output pixel; everything else is touched once per
+// edge, crossing or point, which measured as noise against 570k spans. The
+// ranking is deliberate, not incidental:
+//
+//   w_cov     2.5 KB   several times per pixel   <- worth internal SRAM
+//   w_val     1.0 KB   per value-table entry     <- free, rides along
+//   w_xs     16.0 KB   per crossing per subsample
+//   w_dirs    4.0 KB   per crossing per subsample
+//   w_active  8.0 KB   per edge per subsample
+//   w_pts    16.0 KB   per point                 <- measured as noise
+//
+// MAP_SCRATCH_INTERNAL_KB raises the budget for a build with heap to spare;
+// the reserve below is what stops it ever eating the TLS handshake again.
+#ifndef MAP_SCRATCH_INTERNAL_KB
+#define MAP_SCRATCH_INTERNAL_KB 4
+#endif
+
+// Internal free heap that must survive any scratch allocation, sized for a
+// TLS handshake plus the AES DMA descriptors it needs underneath.
+#ifndef MAP_INTERNAL_RESERVE
+#define MAP_INTERNAL_RESERVE (110 * 1024)
+#endif
+
+static size_t g_scratch_internal = 0;
+
+// Take internal SRAM only while the budget and the reserve both allow it.
+// Falling back to PSRAM is always correct, only slower.
+static void *alloc_fast(size_t n) {
+    size_t budget = (size_t)MAP_SCRATCH_INTERNAL_KB * 1024;
+    if (g_scratch_internal + n <= budget) {
+        size_t freeInt = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (freeInt > n + MAP_INTERNAL_RESERVE) {
+            void *p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (p) { g_scratch_internal += n; return p; }
+        }
+    }
+    return ps_malloc(n);
+}
+
 static bool alloc_all() {
     w_tile   = (uint8_t *)ps_malloc(TILE_CAP);
     w_mvt    = (uint8_t *)ps_malloc(MVT_CAP);
-    w_pts    = (int32_t *)ps_malloc(PT_CAP * 2 * sizeof(int32_t));
-    w_val    = (uint8_t *)ps_malloc(VAL_CAP);
     w_edges  = (rs_edge_t *)ps_malloc(EDGE_CAP * sizeof(rs_edge_t));
-    w_active = (uint16_t *)ps_malloc(XS_CAP * sizeof(uint16_t));
-    w_xs     = (int32_t *)ps_malloc(XS_CAP * sizeof(int32_t));
-    w_dirs   = (int8_t *)ps_malloc(XS_CAP);
-    w_cov    = (uint16_t *)ps_malloc(SUBTILE_PX * sizeof(uint16_t));
+
+    // Requested hottest-first, so the budget is spent where it pays.
+    w_cov    = (uint16_t *)alloc_fast(SUBTILE_PX * sizeof(uint16_t));
+    w_val    = (uint8_t *)alloc_fast(VAL_CAP);
+    w_xs     = (int32_t *)alloc_fast(XS_CAP * sizeof(int32_t));
+    w_dirs   = (int8_t *)alloc_fast(XS_CAP);
+    w_active = (uint16_t *)alloc_fast(XS_CAP * sizeof(uint16_t));
+    w_pts    = (int32_t *)alloc_fast(PT_CAP * 2 * sizeof(int32_t));
+
+    // rs_clear now leaves the coverage buffer zeroed and the fillers rely on
+    // finding it that way, so it must not start life as uninitialised heap.
+    if (w_cov) memset(w_cov, 0, SUBTILE_PX * sizeof(uint16_t));
+
+    Serial.printf("map: scratch %u KB internal, %u KB internal heap free "
+                  "(largest DMA block %u KB)\n",
+                  (unsigned)(g_scratch_internal / 1024),
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024));
+
     return w_tile && w_mvt && w_pts && w_val &&
            w_edges && w_active && w_xs && w_dirs && w_cov;
 }
@@ -714,7 +788,15 @@ void map_set_dark(bool dark) {
     int n = grid_set_zoom(&g_grid, o, jobs, GRID_COUNT);
     xSemaphoreGive(g_glock);
 
-    g_coarse_ok = false;
+    // Deliberately NOT clearing g_coarse_ok.
+    //
+    // The overview is the only thing standing between the user and an empty
+    // screen while the working tiles re-render, and discarding it here meant
+    // the palette switch had nothing at all to draw. A second of map in the
+    // outgoing colours is a far better failure than a second of blank - and
+    // it is longer than a second whenever a background fetch is holding the
+    // archive lock.
+    invalidate_coarse();
     ensure_coarse(o);
     enqueue(jobs, n);
     g_force_redraw = true;
@@ -731,6 +813,19 @@ bool map_is_dark() { return style_is_dark(); }
 // it moved between. Sending only the intersection matters - a 1280px tile
 // pushed whole is 3.3 MB, and doing that for a 70-pixel dot would cost more
 // than the entire visible area.
+// Fill rect A clipped to rect B. Degenerate or non-overlapping inputs draw
+// nothing, which lets callers pass computed bands without pre-checking them.
+static inline void fill_isect(int32_t ax, int32_t ay, int32_t aw, int32_t ah,
+                              int32_t bx, int32_t by, int32_t bw, int32_t bh,
+                              uint16_t col)
+{
+    int32_t x0 = ax > bx ? ax : bx;
+    int32_t y0 = ay > by ? ay : by;
+    int32_t x1 = (ax + aw < bx + bw) ? ax + aw : bx + bw;
+    int32_t y1 = (ay + ah < by + bh) ? ay + ah : by + bh;
+    if (x0 < x1 && y0 < y1) M5.Display.fillRect(x0, y0, x1 - x0, y1 - y0, col);
+}
+
 static void blit_region(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
                         int32_t canvas_x, int32_t canvas_y)
 {
@@ -743,18 +838,44 @@ static void blit_region(int32_t rx, int32_t ry, int32_t rw, int32_t rh,
     if (ry + rh > visBot) rh = visBot - ry;
     if (rw <= 0 || rh <= 0) return;
 
-    // Paint background first when any tile is absent, so the gaps behind
-    // them do not keep whatever was there before - which is how the marker
-    // used to smear across the screen.
-    bool any_missing = false;
-    xSemaphoreTake(g_glock, portMAX_DELAY);
-    for (int i = 0; i < GRID_COUNT; i++)
-        if (!tile_drawable(g_grid.slots[i].state)) { any_missing = true; break; }
-    xSemaphoreGive(g_glock);
-    if (any_missing) M5.Display.fillRect(rx, ry, rw, rh, style_background());
+    const uint16_t bg = style_background();
 
+    // Background is painted into the gaps only, not under everything.
+    //
+    // This used to wipe the whole region whenever any slot was absent and
+    // then paint the tiles back over it. That writes most pixels twice, and
+    // because there is no framebuffer behind the panel the wipe is visible:
+    // one missing tile made the entire map flash to background on every
+    // repaint. Filling just the uncovered parts keeps the reason it existed -
+    // gaps must not keep their previous contents, which is what made the
+    // marker smear - without touching pixels a tile is about to cover.
     xSemaphoreTake(g_glock, portMAX_DELAY);
     M5.Display.startWrite();
+
+    // The grid's footprint on screen. Anything in the region outside it is
+    // covered by no tile at all and has to be background.
+    const int32_t gx0 = -canvas_x;
+    const int32_t gy0 = visTop - canvas_y;
+    const int32_t gx1 = gx0 + (int32_t)GRID_N * SUBTILE_PX;
+    const int32_t gy1 = gy0 + (int32_t)GRID_N * SUBTILE_PX;
+
+    fill_isect(rx, ry, gx0 - rx, rh, rx, ry, rw, rh, bg);              // left
+    fill_isect(gx1, ry, rx + rw - gx1, rh, rx, ry, rw, rh, bg);        // right
+    fill_isect(rx, ry, rw, gy0 - ry, rx, ry, rw, rh, bg);              // above
+    fill_isect(rx, gy1, rw, ry + rh - gy1, rx, ry, rw, rh, bg);        // below
+
+    // Then the individual slots that have nothing to show yet.
+    for (int r = 0; r < GRID_N; r++) {
+        for (int c = 0; c < GRID_N; c++) {
+            int i = r * GRID_N + c;
+            if (tile_drawable(g_grid.slots[i].state)) continue;
+            fill_isect(c * SUBTILE_PX - canvas_x,
+                       visTop + r * SUBTILE_PX - canvas_y,
+                       SUBTILE_PX, SUBTILE_PX,
+                       rx, ry, rw, rh, bg);
+        }
+    }
+
     for (int r = 0; r < GRID_N; r++) {
         for (int c = 0; c < GRID_N; c++) {
             int i = r * GRID_N + c;
@@ -832,6 +953,34 @@ void map_draw(const GnssFix &fix) {
         return;
 
     uint64_t t0 = esp_timer_get_time();
+
+    // A screen with nothing drawable looks identical to a crash, so say so.
+    {
+        bool anyDrawable = false;
+        xSemaphoreTake(g_glock, portMAX_DELAY);
+        for (int i = 0; i < GRID_COUNT; i++)
+            if (tile_drawable(g_grid.slots[i].state)) { anyDrawable = true; break; }
+        xSemaphoreGive(g_glock);
+
+        static uint32_t blankSince = 0;
+        static uint32_t lastMoan = 0;
+        if (!anyDrawable) {
+            if (!blankSince) blankSince = millis();
+            if (millis() - blankSince > 5000 && millis() - lastMoan > 10000) {
+                lastMoan = millis();
+                MapStats st; map_stats(&st);
+                Serial.printf("map: nothing drawable for %lus - overview %s, "
+                              "queue %lu, rendered %lu, failed %lu\n",
+                              (unsigned long)((millis() - blankSince) / 1000),
+                              g_coarse_ok ? "ok" : "MISSING",
+                              (unsigned long)st.queue_depth,
+                              (unsigned long)st.rendered,
+                              (unsigned long)st.failed);
+            }
+        } else {
+            blankSince = 0;
+        }
+    }
 
     if (!have_last || viewMoved || tilesMoved || g_force_redraw) {
         // Everything can have changed; repaint the visible area.

@@ -24,6 +24,9 @@
 #include <SPI.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_task_wdt.h>
+#include <esp_heap_caps.h>
+#include <esp_system.h>
 
 #include <WiFi.h>
 
@@ -217,6 +220,10 @@ static const int PREFETCH_RADIUS = 7;
 enum ThemeMode { THEME_AUTO = 0, THEME_DAY, THEME_NIGHT };
 static ThemeMode g_themeMode = THEME_AUTO;
 
+// Declared here because applyTheme has to know: a brightness change must not
+// wake a screen that was deliberately turned off.
+static bool g_screenOff = false;
+
 static SunSet g_sun;
 static bool   g_sunValid = false;
 static double g_sunriseMin = 0, g_sunsetMin = 0;
@@ -281,10 +288,18 @@ static void applyTheme(const GnssFix &fix) {
     }
     if (wantDark != map_is_dark()) map_set_dark(wantDark);
 
+    // Track the level the screen *should* have, but only drive the backlight
+    // when the screen is actually on.
+    //
+    // Without the guard, a day/night transition while asleep turned the
+    // backlight back on without resuming drawing - a lit panel showing
+    // nothing at all, no map, no status bar, no buttons. Indistinguishable
+    // from a crash, and it survives until someone happens to touch the
+    // middle of the screen.
     uint8_t want = wantDark ? BRIGHT_NIGHT : BRIGHT_DAY;
     if (want != g_brightness) {
         g_brightness = want;
-        M5.Display.setBrightness(want);
+        if (!g_screenOff) M5.Display.setBrightness(want);
     }
 }
 
@@ -293,6 +308,26 @@ static void applyTheme(const GnssFix &fix) {
 // of this strip (FOOTER_H in mapengine) so they are not fighting it for
 // pixels every frame.
 static const int BTN_H = 54, BTN_M = 12;
+
+// ---- flicker-free strips ---------------------------------------------------
+// The status bar and the buttons were painted straight to the panel: fill the
+// region, then draw the text over it. There is no framebuffer behind the
+// display, so those are two separate visible states, and the gap between them
+// shows as a blink on every update - which is most obvious on the status bar
+// because it repaints whenever any counter changes.
+//
+// Composing into an off-screen canvas and pushing it once makes the update a
+// single write of final pixels, so there is no intermediate state to see. The
+// canvases live in PSRAM (about 180 KB together) and are allocated once.
+//
+// If either allocation fails the direct path still works, blink and all, so a
+// tight-memory build degrades rather than losing its UI.
+static const int UI_STATUS_H = 52;          // must match STATUS_H in mapengine
+
+static M5Canvas g_statusCv(&M5.Display);
+static M5Canvas g_btnCv(&M5.Display);
+static bool     g_statusCvOk = false;
+static bool     g_btnCvOk    = false;
 
 // The touch target is taller than the drawn button. A 54 px outline is a
 // small thing to hit on a moving vehicle, and there is nothing else along
@@ -303,7 +338,6 @@ static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 enum { BTN_CACHE = 0, BTN_THEME, BTN_SLEEP, BTN_COUNT };
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
-static bool     g_screenOff = false;
 static uint32_t g_lastTouchMs = 0;
 
 static void buttonRect(int i, int *x, int *y, int *w, int *h) {
@@ -337,8 +371,51 @@ static bool inWakeZone(int px, int py) {
            py >= H / 3 && py < 2 * H / 3;
 }
 
+// Allocate the composition canvases. Safe to call more than once.
+static void uiCanvasesBegin() {
+    if (!g_statusCvOk) {
+        g_statusCv.setPsram(true);
+        g_statusCv.setColorDepth(16);
+        g_statusCvOk = g_statusCv.createSprite(M5.Display.width(), UI_STATUS_H);
+    }
+    if (!g_btnCvOk) {
+        int x, y, w, h; buttonRect(0, &x, &y, &w, &h);
+        g_btnCv.setPsram(true);
+        g_btnCv.setColorDepth(16);
+        g_btnCvOk = g_btnCv.createSprite(w, h);
+    }
+    Serial.printf("ui: status canvas %s, button canvas %s\n",
+                  g_statusCvOk ? "ok" : "FAILED (will draw direct)",
+                  g_btnCvOk ? "ok" : "FAILED (will draw direct)");
+}
+
 static void drawButton(int i, const char *label, uint16_t bg) {
     int x, y, w, h; buttonRect(i, &x, &y, &w, &h);
+
+    if (g_btnCvOk) {
+        // The corners outside the rounded rect are not ours to paint.
+        //
+        // Filling them with what the footer is *supposed* to sit on was a
+        // guess, and it was wrong - they came out a different colour from
+        // the surrounding strip. Rather than guess better, the sprite is
+        // pushed with a colour key so those pixels are never written at all
+        // and whatever is behind them simply stays. That is correct no
+        // matter what painted the footer or when.
+        //
+        // The key only has to be absent from this sprite: the button fills
+        // are greys, blues and greens, the border and label are white.
+        const uint16_t KEY = 0xF81F;            // magenta, unused here
+        g_btnCv.fillSprite(KEY);
+        g_btnCv.fillRoundRect(0, 0, w, h, 10, bg);
+        g_btnCv.drawRoundRect(0, 0, w, h, 10, TFT_WHITE);
+        g_btnCv.setTextDatum(middle_center);
+        g_btnCv.setTextColor(TFT_WHITE);
+        g_btnCv.setTextSize(2);
+        g_btnCv.drawString(label, w / 2, h / 2);
+        g_btnCv.pushSprite(x, y, KEY);
+        return;
+    }
+
     M5.Display.fillRoundRect(x, y, w, h, 10, bg);
     M5.Display.drawRoundRect(x, y, w, h, 10, TFT_WHITE);
     M5.Display.setTextDatum(middle_center);
@@ -406,6 +483,9 @@ static void screenOff() {
 static void screenOn() {
     g_screenOff = false;
     map_set_visible(true);
+    // g_brightness may have been updated by a theme change while asleep, so
+    // this applies whatever the current conditions call for rather than
+    // whatever was set when the screen went off.
     M5.Display.setBrightness(g_brightness);
     M5.Display.fillScreen(style_background());
     Serial.println("screen: on");
@@ -453,7 +533,12 @@ static void handleTouch() {
             portal_run(300000);
             if (WiFi.status() == WL_CONNECTED)
                 configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+            // The portal painted over everything. Without this the engine
+            // sees an unchanged view, unchanged tiles and an unchanged
+            // marker, skips the repaint, and leaves a lit but empty screen
+            // until something else happens to move.
             M5.Display.fillScreen(style_background());
+            map_invalidate();
             break;
         }
         if (millis() < g_confirmUntil) {
@@ -501,7 +586,14 @@ static void bootBegin() {
 }
 
 static void bootStepEx(const char *msg, bool ok, bool pending) {
+    // Logged first, unconditionally. Everything below depends on the panel
+    // being up, and when it is not, height() is 0, the geometry check below
+    // returns early, and the serial trace disappears along with the screen -
+    // which is exactly the boot where the trace is needed most.
+    Serial.printf("boot: %-6s %s\n", pending ? "..." : (ok ? "ok" : "FAIL"), msg);
+
     if (!g_bootActive) return;
+    if (M5.Display.height() <= 0) { if (!pending) g_bootLine++; return; }
     int y = 130 + g_bootLine * 30;
     if (y > M5.Display.height() - 40) return;
     // A pending line is overwritten in place by its result, and the result is
@@ -515,7 +607,6 @@ static void bootStepEx(const char *msg, bool ok, bool pending) {
     M5.Display.setTextColor(TFT_WHITE);
     M5.Display.drawString(msg, 110, y);
     if (!pending) g_bootLine++;
-    Serial.printf("boot: %-6s %s\n", pending ? "..." : (ok ? "ok" : "FAIL"), msg);
 }
 
 // No default arguments: the Arduino preprocessor copies them into the
@@ -562,7 +653,10 @@ static void pickZoom(const GnssFix &fix) {
 // The clock prefers the system time, which SNTP sets and the RTC holds
 // across a reboot; GNSS is the fallback, correct as soon as there is a fix.
 // Both sources are UTC, so neither needs converting.
-static void drawClockBattery(const GnssFix &fix) {
+// `g` is where this draws. The status bar composes into an off-screen canvas
+// whose origin coincides with the panel's, so the coordinates are the same
+// either way and only the target changes.
+static void drawClockBattery(const GnssFix &fix, lgfx::LovyanGFX *g) {
     const int W = M5.Display.width();
     char buf[48];
 
@@ -577,10 +671,10 @@ static void drawClockBattery(const GnssFix &fix) {
         int hh = (fix.utc[0]-'0')*10 + (fix.utc[1]-'0');
         int mm = (fix.utc[2]-'0')*10 + (fix.utc[3]-'0');
         snprintf(buf, sizeof buf, "%02d:%02dZ", hh, mm);
-        M5.Display.setTextDatum(top_right);
-        M5.Display.setTextColor(TFT_WHITE);
-        M5.Display.drawString(buf, W - 12, 6);
-        M5.Display.setTextDatum(top_left);
+        g->setTextDatum(top_right);
+        g->setTextColor(TFT_WHITE);
+        g->drawString(buf, W - 12, 6);
+        g->setTextDatum(top_left);
         return;
     }
 
@@ -606,10 +700,10 @@ static void drawClockBattery(const GnssFix &fix) {
     } else if (charging) {
         col = TFT_GREENYELLOW;
     }
-    M5.Display.setTextDatum(top_right);
-    M5.Display.setTextColor(col);
-    M5.Display.drawString(buf, W - 12, 6);
-    M5.Display.setTextDatum(top_left);
+    g->setTextDatum(top_right);
+    g->setTextColor(col);
+    g->drawString(buf, W - 12, 6);
+    g->setTextDatum(top_left);
 }
 
 static void drawStatus(const GnssFix &fix) {
@@ -665,31 +759,95 @@ static void drawStatus(const GnssFix &fix) {
     strncpy(last, combined, sizeof last - 1);
     lastDraw = millis();
 
-    M5.Display.fillRect(0, 0, W, 52,
-                        have ? (map_is_dark() ? M5.Display.color565(10, 40, 20)
-                                              : TFT_DARKGREEN)
-                             : 0x6000);
-    M5.Display.setTextDatum(top_left);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.drawString(statusLine1, 12, 6);
-    M5.Display.setTextColor(TFT_LIGHTGREY);
-    M5.Display.drawString(buf, 12, 28);
-    drawClockBattery(fix);
+    const uint16_t barBg = have
+        ? (map_is_dark() ? M5.Display.color565(10, 40, 20) : TFT_DARKGREEN)
+        : 0x6000;
+
+    // Compose the whole bar, then push it in one write. Drawing the fill and
+    // the text straight to the panel makes the bare fill briefly visible,
+    // which is the blink.
+    lgfx::LovyanGFX *g = g_statusCvOk ? (lgfx::LovyanGFX *)&g_statusCv
+                                      : (lgfx::LovyanGFX *)&M5.Display;
+
+    if (g_statusCvOk) g_statusCv.fillSprite(barBg);
+    else              M5.Display.fillRect(0, 0, W, UI_STATUS_H, barBg);
+
+    g->setTextDatum(top_left);
+    g->setTextSize(2);
+    g->setTextColor(TFT_WHITE);
+    g->drawString(statusLine1, 12, 6);
+    g->setTextColor(TFT_LIGHTGREY);
+    g->drawString(buf, 12, 28);
+    drawClockBattery(fix, g);
 
     // Stale-link warning: the module going quiet looks identical to "no fix"
     // unless it is called out separately.
     if (millis() - fix.lastSentence > 3000) {
-        M5.Display.setTextDatum(top_right);
-        M5.Display.setTextColor(TFT_RED);
-        M5.Display.drawString("NO GNSS", W - 12, 30);
-        M5.Display.setTextDatum(top_left);
+        g->setTextDatum(top_right);
+        g->setTextColor(TFT_RED);
+        g->drawString("NO GNSS", W - 12, 30);
+        g->setTextDatum(top_left);
     }
+
+    if (g_statusCvOk) g_statusCv.pushSprite(0, 0);
+}
+
+// Survives a soft reset, so the retry below cannot become a boot loop.
+RTC_NOINIT_ATTR static uint32_t s_panelMagic;
+RTC_NOINIT_ATTR static uint32_t s_panelRetries;
+
+// Bring the panel up, and notice when it has not.
+//
+// After a full flash write the panel sometimes fails to initialise: PSRAM
+// reads back as entirely free because the framebuffer was never allocated
+// (1800 KB for 1280x720 at 16bpp - the exact gap between a good boot and a
+// dark one), width() and height() return 0, and every later draw silently
+// goes nowhere. The board looks like it has a backlight problem; in fact
+// nothing has been initialised to light up.
+//
+// It comes up on the next flash because that upload writes no sectors - it
+// only verifies - so the reset follows an idle bus rather than six seconds of
+// sustained flash writing. Giving it a moment and asking again is enough in
+// most cases, and a single restart covers the rest.
+static bool panelBegin() {
+    if (M5.Display.width() > 0 && M5.Display.height() > 0) return true;
+
+    Serial.println("display: panel did not come up, retrying init");
+    delay(300);
+    M5.Display.init();
+    if (M5.Display.width() > 0 && M5.Display.height() > 0) {
+        Serial.println("display: panel up after retry");
+        return true;
+    }
+
+    if (s_panelMagic != 0x5AB5D157u) {          // first boot, counter is junk
+        s_panelMagic = 0x5AB5D157u;
+        s_panelRetries = 0;
+    }
+    if (s_panelRetries < 1) {
+        s_panelRetries++;
+        Serial.println("display: still down, restarting once to retry");
+        Serial.flush();
+        delay(100);
+        esp_restart();
+    }
+
+    Serial.println("display: panel unavailable, continuing headless");
+    return false;
 }
 
 void setup() {
+    // A moment before touching I2C. M5.begin() brings up the panel over the
+    // internal bus, and the boot that fails is the one immediately following
+    // a sustained flash write.
+    delay(150);
+
     auto cfg = M5.config();
     M5.begin(cfg);
+
+    bool panel = panelBegin();
+    if (s_panelMagic == 0x5AB5D157u) s_panelRetries = 0;   // reached a good boot
+
     M5.Display.setRotation(3);                 // landscape, as in the GNSS sketch
     M5.Display.setBrightness(BRIGHT_DAY);
     M5.Display.fillScreen(TFT_BLACK);
@@ -701,8 +859,35 @@ void setup() {
     // No Wire.begin() anywhere: M5.begin() already configured the internal
     // I2C bus, and reconfiguring it breaks touch, the RTC and the IMU.
 
-    Serial.printf("\n=== Tab5 map ===\nPSRAM %u KB free\n",
-                  (unsigned)(ESP.getFreePsram() / 1024));
+    // Which reset this was, so a dark-screen boot can be told apart from a
+    // sketch fault. POWERON is a real power cycle; SW / USB / JTAG mean the
+    // peripherals outside the P4 did not restart with it.
+    const char *rr = "?";
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:  rr = "power-on";      break;
+        case ESP_RST_SW:       rr = "software";      break;
+        case ESP_RST_PANIC:    rr = "panic";         break;
+        case ESP_RST_INT_WDT:  rr = "int watchdog";  break;
+        case ESP_RST_TASK_WDT: rr = "task watchdog"; break;
+        case ESP_RST_WDT:      rr = "other watchdog";break;
+        case ESP_RST_DEEPSLEEP:rr = "deep sleep";    break;
+        case ESP_RST_BROWNOUT: rr = "brownout";      break;
+        case ESP_RST_EXT:      rr = "external pin";  break;
+        default:               rr = "unknown";       break;
+    }
+
+    // Panel state alongside the reset reason. The reset reason turned out not
+    // to distinguish a dark boot from a good one - both report the same - so
+    // the useful signal is the panel geometry, which is 0x0 exactly when the
+    // framebuffer was never allocated.
+    Serial.printf("\n=== Tab5 map ===\nPSRAM %u KB free\nreset: %s, panel %dx%d %s\n",
+                  (unsigned)(ESP.getFreePsram() / 1024), rr,
+                  M5.Display.width(), M5.Display.height(),
+                  panel ? "ok" : "DOWN");
+
+    // After setRotation, so the canvas width matches the panel's, and before
+    // anything draws the status bar or the buttons.
+    uiCanvasesBegin();
 
     bootBegin();
 
@@ -786,10 +971,56 @@ void setup() {
     bootStepBusy("waiting for GPS fix");
     delay(600);
     bootEnd();
+    // 30 s: far longer than any legitimate operation in loop(), so this only
+    // fires on a genuine wedge. portal_run blocks for minutes by design and
+    // resets the timer itself.
+    esp_task_wdt_config_t wdt = { .timeout_ms = 30000,
+                                  .idle_core_mask = 0,
+                                  .trigger_panic = true };
+    esp_task_wdt_reconfigure(&wdt);
+    esp_task_wdt_add(nullptr);
+
     Serial.println("running");
 }
 
+// Heartbeat and watchdog.
+//
+// A wedged loop() is invisible: the backlight stays wherever it was, the
+// panel keeps its last contents, and touch stops responding - which looks
+// identical to a crash, a sleep, and a black map. The heartbeat says which,
+// and the watchdog turns a silent hang into a reboot with a backtrace
+// instead of a device that has to be power-cycled blind.
+static void loopHeartbeat() {
+    static uint32_t last = 0;
+    static uint32_t iters = 0;
+    iters++;
+    if (millis() - last < 30000) return;
+    last = millis();
+
+    // Free heap alone cannot tell a leak from ordinary churn, and it was the
+    // free-heap number that looked fine right up until the AES DMA descriptor
+    // allocation failed. Three figures separate the cases:
+    //
+    //   heap      falling and not recovering        -> something is retained
+    //   min       the low-water mark since boot     -> worst moment so far
+    //   dma       largest single DMA-capable block  -> what a handshake can get
+    //
+    // A TLS handshake needs a contiguous DMA block, so `dma` collapsing while
+    // `heap` still looks healthy is fragmentation, and is just as fatal.
+    Serial.printf("alive: loop %lu iters, uptime %lus, heap %u KB "
+                  "(min %u KB, dma %u KB), psram %u KB, stack headroom %u B\n",
+                  (unsigned long)iters, (unsigned long)(millis() / 1000),
+                  (unsigned)(ESP.getFreeHeap() / 1024),
+                  (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024),
+                  (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024),
+                  (unsigned)(ESP.getFreePsram() / 1024),
+                  (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+    iters = 0;
+}
+
 void loop() {
+    esp_task_wdt_reset();
+    loopHeartbeat();
     M5.update();
 
     GnssFix fix;
@@ -799,6 +1030,12 @@ void loop() {
     handlePowerButton();
     flushIfIdle();
     applyTheme(fix);
+
+    // Belt and braces: if anything at all lights the panel while the screen
+    // is meant to be off, put it back. A lit screen showing nothing gives
+    // the user no indication that a touch in the middle would fix it.
+    if (g_screenOff && M5.Display.getBrightness() != 0)
+        M5.Display.setBrightness(0);
 
     map_update(fix);
     pickZoom(fix);

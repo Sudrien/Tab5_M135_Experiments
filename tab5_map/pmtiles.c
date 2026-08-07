@@ -132,6 +132,7 @@ pmt_err_t pmt_open(pmt_t *p) {
 
     if (d->root_len == 0) return PMT_EFORMAT;
     if (p->root_cache) p->root_cache_len = 0;   // invalidate
+    p->dir_len = 0;                             // dir_buf identity too
     return PMT_OK;
 }
 
@@ -147,6 +148,17 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
         *out_len = p->root_cache_len;
         return PMT_OK;
     }
+
+    // Already decompressed in dir_buf from a previous lookup.
+    if (!is_root && p->dir_len && off == p->dir_off && len == p->dir_srclen) {
+        *out = p->dir_buf;
+        *out_len = p->dir_len;
+        return PMT_OK;
+    }
+
+    // From here dir_buf is about to be overwritten, so what it held is no
+    // longer valid - including if the read or inflate below fails.
+    p->dir_len = 0;
 
     if (len > p->raw_cap) { p->need_raw = len; return PMT_ENOMEM; }
     if (p->read(p->io_ctx, off, len, p->raw_buf) != 0) return PMT_EIO;
@@ -171,6 +183,15 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
         *out = p->root_cache;
         *out_len = dec_len;
         return PMT_OK;
+    }
+
+    // Remember what dir_buf now holds. Not done for the root: when the root
+    // is served from root_cache it never reaches here, and when it is not,
+    // leaving dir_len at 0 simply means no reuse rather than a wrong hit.
+    if (!is_root) {
+        p->dir_off = off;
+        p->dir_srclen = len;
+        p->dir_len = dec_len;
     }
 
     *out = p->dir_buf;
@@ -306,16 +327,22 @@ pmt_err_t pmt_find(pmt_t *p, uint8_t z, uint32_t x, uint32_t y,
     return PMT_EFORMAT;
 }
 
+pmt_err_t pmt_read_blob(pmt_t *p, uint64_t off, uint32_t len,
+                        uint8_t *dst, uint32_t *dst_len)
+{
+    if (len > *dst_len) { p->need_raw = len; return PMT_ENOMEM; }
+    if (p->read(p->io_ctx, off, len, dst) != 0) return PMT_EIO;
+    *dst_len = len;
+    return PMT_OK;
+}
+
 pmt_err_t pmt_get(pmt_t *p, uint8_t z, uint32_t x, uint32_t y,
                   uint8_t *dst, uint32_t *dst_len)
 {
     uint64_t off; uint32_t len;
     pmt_err_t e = pmt_find(p, z, x, y, &off, &len);
     if (e != PMT_OK) return e;
-    if (len > *dst_len) { p->need_raw = len; return PMT_ENOMEM; }
-    if (p->read(p->io_ctx, off, len, dst) != 0) return PMT_EIO;
-    *dst_len = len;
-    return PMT_OK;
+    return pmt_read_blob(p, off, len, dst, dst_len);
 }
 
 const char *pmt_strerror(pmt_err_t e) {

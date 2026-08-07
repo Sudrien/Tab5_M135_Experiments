@@ -87,6 +87,7 @@ typedef struct {
 
     // Per-row coverage accumulator, 0..RS_SUBSAMPLES*256 per pixel.
     uint16_t  *cov;
+    int32_t    cov_lo, cov_hi;  // pixel range dirtied in the current row
 
     // Style table, indexed by the style byte the MVT decoder produced.
     const rs_style_t *styles;

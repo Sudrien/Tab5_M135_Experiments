@@ -67,6 +67,35 @@ static pmt_t   g_local;                 // world.pmtiles, offline floor
 static bool    g_local_ok = false;
 static pmt_t   g_remote;                // current build, over HTTP
 static bool    g_remote_ok = false;
+
+// ---- deduplicated blob memo ------------------------------------------------
+// PMTiles stores identical tiles once and points every one of them at the same
+// (offset, length). Whole oceans at low zoom are a single 93-byte blob, and the
+// world floor walk was paying a full HTTPS request - TLS handshake included -
+// for each of the thousands of tiles that share it:
+//
+//   netsource: 6/31/37 at offset 14969040 len 93
+//   netsource: 6/31/38 at offset 14969040 len 93
+//   netsource: 6/31/39 at offset 14969040 len 93   ... and so on
+//
+// Two tiles resolving to the same (offset, length) are the same bytes by
+// construction, so the second one never needs fetching. Holding just the last
+// blob is enough: the walk is raster order, so identical tiles arrive in long
+// runs. Sized for the small shared payloads this exists for - a real tile
+// misses the memo and takes the normal path.
+#define MEMO_CAP 4096
+static uint8_t  g_memo[MEMO_CAP];
+static uint64_t g_memo_off = 0;
+static uint32_t g_memo_len = 0;
+static bool     g_memo_valid = false;
+
+static void memo_clear() { g_memo_valid = false; g_memo_off = 0; g_memo_len = 0; }
+
+static void memo_store(uint64_t off, const uint8_t *src, uint32_t len) {
+    if (len == 0 || len > MEMO_CAP) { return; }   // too big to be worth holding
+    memcpy(g_memo, src, len);
+    g_memo_off = off; g_memo_len = len; g_memo_valid = true;
+}
 static char    g_build[16] = "";
 static uint32_t g_adopted_epochdays = 0;
 static uint32_t g_today_epochdays = 0;
@@ -134,6 +163,10 @@ static bool fit_buffers(pmt_t *p, uint8_t **raw, uint8_t **dir, uint8_t **root,
     p->dir_buf = *dir; p->dir_cap = dcap;
     p->root_cache = *root; p->root_cache_cap = dcap;
     p->root_cache_len = 0;
+    // dir_buf was just freed and replaced, so whatever it was recorded as
+    // holding is gone with it. Without this a stale identity would match and
+    // hand back the contents of a freed allocation.
+    p->dir_len = 0;
 
     Serial.printf("netsource: %s scratch -> raw %lu KB, dir %lu KB\n",
                   what, (unsigned long)(want / 1024), (unsigned long)(dcap / 1024));
@@ -254,7 +287,11 @@ static int http_range(const String &url, uint64_t off, uint32_t len, uint8_t *ds
 
     WiFiClient *s = http.getStreamPtr();
     uint32_t got = 0;
-    uint32_t deadline = millis() + 15000;
+    // Scale the budget with the request size instead of using a flat 15 s.
+    // A 129 KB leaf directory was arriving at under 3 KB/s and getting cut
+    // off at a third of the way through, every time, for every tile in its
+    // range - which stalled the world floor permanently at 65%.
+    uint32_t deadline = millis() + 10000 + len / 4;   // ~4 KB/s floor
     uint32_t reads = 0;
     while (got < len && millis() < deadline) {
         reads++;
@@ -281,9 +318,33 @@ static int http_range(const String &url, uint64_t off, uint32_t len, uint8_t *ds
     return 0;
 }
 
+// Large ranges are split into several requests.
+//
+// Small reads come back promptly; the 129 KB one did not, consistently, across
+// separate boots and different tiles. Whatever the cause upstream - CDN
+// behaviour on big ranges, or a window that never opens - a request the size
+// of the ones that already work is the reliable shape. The extra round trips
+// only apply to directory-sized reads, which the leaf cache below now makes
+// rare.
+static const uint32_t RANGE_CHUNK = 32 * 1024;
+
 static int net_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     (void)ctx;
-    return http_range(remote_url(), off, len, dst);
+    if (len <= RANGE_CHUNK) return http_range(remote_url(), off, len, dst);
+
+    String url = remote_url();      // build once for the whole split read
+    uint32_t done = 0;
+    while (done < len) {
+        uint32_t n = len - done;
+        if (n > RANGE_CHUNK) n = RANGE_CHUNK;
+        if (http_range(url, off + done, n, dst + done) != 0) {
+            Serial.printf("netsource: split read failed at %lu/%lu bytes\n",
+                          (unsigned long)done, (unsigned long)len);
+            return -1;
+        }
+        done += n;
+    }
+    return 0;
 }
 
 // ---- SD-backed pmtiles read ------------------------------------------------
@@ -507,6 +568,7 @@ static bool open_remote() {
     g_remote.dir_buf = r_dir; g_remote.dir_cap = r_cap * DIR_EXPAND;
     g_remote.raw_buf = r_raw; g_remote.raw_cap = r_cap;
     g_remote.root_cache = r_root; g_remote.root_cache_cap = r_cap * DIR_EXPAND;
+    memo_clear();   // offsets are only meaningful within one archive
     g_remote_ok = (pmt_open(&g_remote) == PMT_OK);
     if (g_remote_ok) {
         Serial.printf("netsource: remote build %s open, z%u..%u, root %lu B\n",
@@ -644,38 +706,65 @@ static bool netsource_get_locked(uint8_t z, uint32_t x, uint32_t y,
     // 2. network
     if (maybe_refresh() && g_remote_ok) {
         g_stats.online = true;
-        uint64_t dbg_off = 0; uint32_t dbg_len = 0;
-        pmt_err_t fe = pmt_find(&g_remote, z, x, y, &dbg_off, &dbg_len);
-        if (fe == PMT_OK) {
-            static uint32_t shown = 0;
-            if (shown < 12) {
-                shown++;
-                Serial.printf("netsource: %u/%lu/%lu at offset %llu len %lu\n",
-                              z, (unsigned long)x, (unsigned long)y,
-                              (unsigned long long)dbg_off, (unsigned long)dbg_len);
-            }
-        }
 
-        uint32_t n = cap;
-        pmt_err_t e = pmt_get(&g_remote, z, x, y, dst, &n);
+        // Resolve the tile's location once. pmt_get would repeat this walk
+        // internally, and for a working-zoom tile that walk pulls a leaf
+        // directory over HTTP - so the old debug-only find was quietly
+        // doubling the request count on exactly the tiles the user is
+        // waiting for.
+        uint64_t off = 0; uint32_t blob_len = 0;
+        pmt_err_t fe = pmt_find(&g_remote, z, x, y, &off, &blob_len);
 
         // A leaf directory larger than the current scratch is not an error,
-        // just a buffer that was sized before we knew what the archive
-        // contained. The reader reports what it needed; grow once and retry.
-        if (e == PMT_ENOMEM && g_remote.need_raw > r_cap &&
+        // just a buffer sized before we knew what the archive contained. The
+        // reader reports what it needed; grow once and retry. This belongs on
+        // the lookup, because the lookup is what loads leaf directories.
+        if (fe == PMT_ENOMEM && g_remote.need_raw > r_cap &&
             g_remote.need_raw <= DIR_CAP_MAX) {
             Serial.printf("netsource: leaf needs %lu B, growing from %lu KB\n",
                           (unsigned long)g_remote.need_raw,
                           (unsigned long)(r_cap / 1024));
             if (fit_buffers(&g_remote, &r_raw, &r_dir, &r_root, &r_cap,
-                            "remote", g_remote.need_raw)) {
-                n = cap;
-                e = pmt_get(&g_remote, z, x, y, dst, &n);
+                            "remote", g_remote.need_raw))
+                fe = pmt_find(&g_remote, z, x, y, &off, &blob_len);
+        }
+
+        if (fe == PMT_OK) {
+            static uint32_t shown = 0;
+            if (shown < 12) {
+                shown++;
+                Serial.printf("netsource: %u/%lu/%lu at offset %llu len %lu%s\n",
+                              z, (unsigned long)x, (unsigned long)y,
+                              (unsigned long long)off, (unsigned long)blob_len,
+                              (g_memo_valid && off == g_memo_off &&
+                               blob_len == g_memo_len) ? " (memo)" : "");
+            }
+
+            // Same blob as last time: it is the same bytes, by construction.
+            if (g_memo_valid && off == g_memo_off && blob_len == g_memo_len &&
+                blob_len <= cap) {
+                memcpy(dst, g_memo, blob_len);
+                cache_write(z, x, y, dst, blob_len);
+                *len = blob_len;
+                g_stats.cache_hits++;
+                return true;
             }
         }
 
+        // Read the payload from the location already resolved above, rather
+        // than pmt_get, which would walk the directory a second time - and
+        // over the network that walk is another leaf fetch and another TLS
+        // handshake for a tile we have already located.
+        uint32_t n = cap;
+        pmt_err_t e = (fe == PMT_OK)
+                    ? pmt_read_blob(&g_remote, off, blob_len, dst, &n)
+                    : fe;
+
         if (e == PMT_OK) {
             cache_write(z, x, y, dst, n);
+            // Remember small payloads so the next tile sharing this blob
+            // costs nothing.
+            if (fe == PMT_OK && n == blob_len) memo_store(off, dst, n);
             *len = n;
             g_stats.net_hits++;
             if (from_net) *from_net = true;
