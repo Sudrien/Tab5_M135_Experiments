@@ -6,6 +6,7 @@
 #include <SD_MMC.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <esp_heap_caps.h>
 #include <time.h>
 #include <esp_sntp.h>
 #include <freertos/FreeRTOS.h>
@@ -240,52 +241,123 @@ void netsource_set_date(const char *ddmmyy) {
 // ---- HTTP range read -------------------------------------------------------
 static String remote_url() { return String(BUILD_HOST) + g_build + ".pmtiles"; }
 
-static int http_range(const String &url, uint64_t off, uint32_t len, uint8_t *dst) {
-    if (WiFi.status() != WL_CONNECTED) return -1;
+// ---- pooled HTTPS connection ----------------------------------------------
+// Every fetch used to open a fresh TLS connection. The handshake dominated the
+// cost of a small tile and was the peak internal-heap moment in the program,
+// so keeping the socket between requests is the single biggest win available
+// here.
+//
+// The reason it was originally disabled is real and has to be handled rather
+// than assumed away: a response whose body is not fully drained leaves those
+// bytes in the socket, and the next request reads them as its own reply. That
+// surfaces as a tile which fetches "successfully" and then fails to inflate -
+// a corruption bug, not a connection bug, and a miserable one to trace back
+// here. So the rule below is strict: the connection survives only a request
+// that completed exactly as expected. Anything else - wrong status, wrong
+// length, short read, a single unread byte - tears it down. Reconnecting
+// costs a handshake; guessing costs correctness.
+//
+// The gap keeps the request rate deliberately low. The handshake used to
+// provide that spacing as a side effect, and removing it without replacing it
+// would turn a polite client into a hostile one against a bucket we are asked
+// not to hotlink.
+#ifndef NET_REQUEST_GAP_MS
+#define NET_REQUEST_GAP_MS 150
+#endif
 
-    HTTPClient http;
-    // Deliberately NOT reusing the connection.
-    //
-    // With reuse, a request whose body is not fully drained leaves those
-    // bytes in the socket, and the next request reads them as its own
-    // response - which surfaces as a tile that fetches "successfully" and
-    // then fails to inflate. Every error path here ends the request early,
-    // so that window is wide open.
-    //
-    // A fresh connection per tile costs a handshake, which also keeps the
-    // request rate politely low against a bucket we are told not to hotlink.
-    http.setReuse(false);
-    http.setTimeout(15000);
-    if (!http.begin(url)) return -1;
+// Drop a pooled socket that has been idle this long rather than discover it
+// closed. Servers expire keep-alives on their own schedule.
+#ifndef NET_KEEPALIVE_IDLE_MS
+#define NET_KEEPALIVE_IDLE_MS 10000
+#endif
+
+// Smallest contiguous DMA-capable block worth attempting a TLS handshake with.
+//
+// The handshake needs one for the AES engine, and that allocation failing is
+// not a graceful error - it surfaces as `esp-aes: Failed to allocate memory
+// for len descriptor` and takes the fetch down with it. A prefetch burst runs
+// the largest free DMA block down to around 43 KB, which is *below* the level
+// at which handshakes were failing back when every fetch made one. Pooling
+// keeps that safe by handshaking once at the start of a burst, while memory is
+// still plentiful - but a keep-alive dropped by the far end mid-burst would
+// reconnect at exactly the low-water mark. Skipping one tile is much cheaper
+// than a failed handshake.
+#ifndef NET_HANDSHAKE_MIN_DMA
+#define NET_HANDSHAKE_MIN_DMA (32 * 1024)
+#endif
+
+static HTTPClient g_http;
+static bool       g_http_live = false;   // g_http holds a begun request/socket
+static uint32_t   g_http_last = 0;       // millis at the end of the last request
+static uint32_t   g_http_reused = 0, g_http_fresh = 0;
+
+// Tear the pooled connection down for good.
+static void http_pool_drop() {
+    if (!g_http_live) return;
+    g_http.setReuse(false);              // make end() actually close it
+    g_http.end();
+    g_http_live = false;
+}
+
+// One attempt. *pooled reports whether this went out on an already-open
+// socket, which decides whether a failure is worth retrying.
+static int http_range_once(const String &url, uint64_t off, uint32_t len,
+                           uint8_t *dst, bool *pooled)
+{
+    *pooled = g_http_live;
+
+    if (!g_http_live) {
+        // About to handshake. Check there is room for it first.
+        size_t dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        if (dma < NET_HANDSHAKE_MIN_DMA) {
+            delay(250);                  // a transient dip is common mid-burst
+            dma = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+        }
+        if (dma < NET_HANDSHAKE_MIN_DMA) {
+            Serial.printf("netsource: deferring handshake, largest DMA block "
+                          "%u KB\n", (unsigned)(dma / 1024));
+            return -1;
+        }
+        g_http.setReuse(true);
+        g_http.setTimeout(15000);
+        if (!g_http.begin(url)) { g_http_live = false; return -1; }
+        g_http_live = true;
+        g_http_fresh++;
+    } else {
+        // Same host and scheme every time, so begin() re-arms the request on
+        // the socket that is already open.
+        if (!g_http.begin(url)) { http_pool_drop(); return -1; }
+        g_http_reused++;
+    }
 
     char range[64];
     snprintf(range, sizeof range, "bytes=%llu-%llu",
              (unsigned long long)off, (unsigned long long)(off + len - 1));
-    http.addHeader("Range", range);
+    g_http.addHeader("Range", range);
 
     uint64_t t0 = esp_timer_get_time();
-    int code = http.GET();
+    int code = g_http.GET();
     // 206 is the expected answer. A 200 means the server ignored the Range
     // header and is about to send the entire multi-gigabyte archive, which
     // must be refused rather than read.
     if (code != HTTP_CODE_PARTIAL_CONTENT) {
         if (code == HTTP_CODE_OK)
             Serial.println("netsource: server ignored Range header, refusing");
-        http.end();
+        http_pool_drop();                // body unread - socket is unusable
         return -1;
     }
 
     // A 206 must carry exactly the requested range; anything else means the
     // response does not correspond to this request.
-    int clen = http.getSize();
+    int clen = g_http.getSize();
     if (clen >= 0 && (uint32_t)clen != len) {
         Serial.printf("netsource: range asked %lu got %d bytes, discarding\n",
                       (unsigned long)len, clen);
-        http.end();
+        http_pool_drop();
         return -1;
     }
 
-    WiFiClient *s = http.getStreamPtr();
+    WiFiClient *s = g_http.getStreamPtr();
     uint32_t got = 0;
     // Scale the budget with the request size instead of using a flat 15 s.
     // A 129 KB leaf directory was arriving at under 3 KB/s and getting cut
@@ -301,21 +373,60 @@ static int http_range(const String &url, uint64_t off, uint32_t len, uint8_t *ds
         if (n <= 0) break;
         got += n;
     }
-    // Drain whatever is left before closing. Harmless without reuse, and it
-    // stops a half-read response poisoning anything if reuse is ever enabled.
+
     uint32_t leftover = 0;
     while (s->available()) { s->read(); leftover++; }
-    http.end();
+
     g_stats.last_fetch_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    g_http_last = millis();
+
     if (got != len || leftover) {
         Serial.printf("netsource: range %llu+%lu -> got %lu in %lu reads, "
                       "%lu left over\n", (unsigned long long)off,
                       (unsigned long)len, (unsigned long)got,
                       (unsigned long)reads, (unsigned long)leftover);
+        // Either the body was short or there was more of it than the headers
+        // promised. In both cases the stream framing is no longer trustworthy,
+        // so the socket does not survive.
+        http_pool_drop();
+        return -1;
     }
-    if (got != len) return -1;
+
+    g_http.end();                        // reuse is on, so this keeps the socket
     g_stats.bytes_fetched += got;
+
+    // Periodic proof that pooling is actually happening. If `fresh` climbs in
+    // step with `reused`, the socket is being torn down every request and the
+    // handshake has not gone anywhere.
+    if (((g_http_reused + g_http_fresh) % 25) == 0)
+        Serial.printf("netsource: conn %lu reused, %lu fresh, last fetch %lu ms\n",
+                      (unsigned long)g_http_reused, (unsigned long)g_http_fresh,
+                      (unsigned long)g_stats.last_fetch_ms);
     return 0;
+}
+
+static int http_range(const String &url, uint64_t off, uint32_t len, uint8_t *dst) {
+    if (WiFi.status() != WL_CONNECTED) { http_pool_drop(); return -1; }
+
+    // Retire a socket the server has probably given up on already.
+    if (g_http_live && (uint32_t)(millis() - g_http_last) > NET_KEEPALIVE_IDLE_MS)
+        http_pool_drop();
+
+    // Space requests out, measured from the end of the previous one.
+    uint32_t since = millis() - g_http_last;
+    if (g_http_last && since < NET_REQUEST_GAP_MS) delay(NET_REQUEST_GAP_MS - since);
+
+    bool pooled = false;
+    int r = http_range_once(url, off, len, dst, &pooled);
+    if (r == 0 || !pooled) return r;
+
+    // A pooled socket failing is expected occasionally: keep-alives get closed
+    // from the far end with no warning, and the failure looks identical to a
+    // real error. Retrying once on a fresh connection separates the two, and
+    // without it every server-side timeout would surface as a lost tile.
+    http_pool_drop();
+    Serial.println("netsource: pooled connection failed, retrying fresh");
+    return http_range_once(url, off, len, dst, &pooled);
 }
 
 // Large ranges are split into several requests.
